@@ -1,0 +1,144 @@
+{% extends "base.html" %}
+{% block title %}Overview · Aegis{% endblock %}
+{% block content %}
+<div class="mb-6 flex items-end justify-between">
+  <div>
+    <h1 class="text-2xl font-semibold">Tenant overview</h1>
+    <p class="text-sm text-slate-400">{{ ctx.tenant.name }} · plan <code class="text-emerald-300">{{ ctx.tenant.plan }}</code> · profiles
+      <code class="text-emerald-300">{{ ctx.tenant.compliance_profiles }}</code></p>
+  </div>
+</div>
+
+<section class="grid gap-6 md:grid-cols-3">
+  <div class="rounded-xl border border-slate-800 bg-slate-900/40 p-5">
+    <h2 class="text-sm font-medium text-slate-300">API keys</h2>
+    <p class="mt-1 text-3xl font-semibold">{{ keys|length }}</p>
+    <details class="mt-3">
+      <summary class="cursor-pointer text-sm text-emerald-300">Create new key</summary>
+      <form id="newkey" class="mt-3 space-y-2 text-sm">
+        <input name="name" placeholder="e.g. Production API" required
+               class="w-full rounded border border-slate-700 bg-slate-950 px-2 py-1" />
+        <input name="user_label" placeholder="Owner / app name (optional)"
+               class="w-full rounded border border-slate-700 bg-slate-950 px-2 py-1" />
+        <button class="rounded bg-emerald-500 px-3 py-1 font-medium text-slate-950">Generate</button>
+      </form>
+      <pre id="newkey-out" class="mt-3 hidden rounded bg-slate-950 p-3 text-xs"></pre>
+    </details>
+    <ul class="mt-4 space-y-1 text-xs text-slate-300">
+      {% for k in keys %}
+        <li class="flex items-center justify-between gap-2">
+          <span class="truncate">
+            <code class="text-slate-100">aeg_*_{{ k.prefix }}…</code>
+            <span class="text-slate-500">{{ k.name }}</span>
+            {% if k.revoked %}<span class="pill bg-red-900 text-red-200">revoked</span>{% endif %}
+          </span>
+          {% if not k.revoked %}
+          <button class="text-red-300 hover:text-red-200" onclick="revokeKey('{{ k.id }}')">revoke</button>
+          {% endif %}
+        </li>
+      {% endfor %}
+    </ul>
+  </div>
+
+  <div class="rounded-xl border border-slate-800 bg-slate-900/40 p-5">
+    <h2 class="text-sm font-medium text-slate-300">Provider credentials</h2>
+    <p class="mt-1 text-3xl font-semibold">{{ creds|length }}</p>
+    <details class="mt-3">
+      <summary class="cursor-pointer text-sm text-emerald-300">Add / update</summary>
+      <form id="newcred" class="mt-3 space-y-2 text-sm">
+        <select name="provider" class="w-full rounded border border-slate-700 bg-slate-950 px-2 py-1">
+          <option value="openai">openai</option>
+          <option value="anthropic">anthropic</option>
+        </select>
+        <input name="api_key" placeholder="Upstream API key" required
+               class="w-full rounded border border-slate-700 bg-slate-950 px-2 py-1" />
+        <input name="base_url" placeholder="Base URL (optional)"
+               class="w-full rounded border border-slate-700 bg-slate-950 px-2 py-1" />
+        <button class="rounded bg-emerald-500 px-3 py-1 font-medium text-slate-950">Save</button>
+      </form>
+    </details>
+    <ul class="mt-4 space-y-1 text-xs text-slate-300">
+      {% for c in creds %}
+      <li><strong class="text-emerald-300">{{ c.provider }}</strong> · key <code>{{ '*' * 4 }}{{ c.api_key[-4:] if c.api_key|length >= 4 else '' }}</code>{% if c.base_url %} · {{ c.base_url }}{% endif %}</li>
+      {% endfor %}
+    </ul>
+  </div>
+
+  <div class="rounded-xl border border-slate-800 bg-slate-900/40 p-5">
+    <h2 class="text-sm font-medium text-slate-300">Policies (overrides)</h2>
+    <p class="mt-1 text-3xl font-semibold">{{ policies|length }}</p>
+    <p class="mt-1 text-xs text-slate-400">Tenant-level overrides on top of compliance profiles.</p>
+    <ul class="mt-4 space-y-1 text-xs text-slate-300">
+      {% for p in policies %}
+      <li>{{ p.priority }}. <strong>{{ p.name }}</strong> {% if not p.enabled %}<span class="pill bg-slate-700 text-slate-200">disabled</span>{% endif %}</li>
+      {% else %}
+      <li class="text-slate-500">No overrides — compliance profile defaults are in effect.</li>
+      {% endfor %}
+    </ul>
+  </div>
+</section>
+
+<section class="mt-10">
+  <div class="mb-3 flex items-end justify-between">
+    <h2 class="text-lg font-semibold">Recent AI activity</h2>
+    <a href="/admin/audit" class="text-sm text-emerald-300 hover:underline">Full audit log →</a>
+  </div>
+  <div class="overflow-hidden rounded-xl border border-slate-800">
+    <table class="min-w-full divide-y divide-slate-800 text-sm">
+      <thead class="bg-slate-900/60 text-left text-xs uppercase tracking-wider text-slate-400">
+        <tr>
+          <th class="px-4 py-2">When</th>
+          <th class="px-4 py-2">Actor</th>
+          <th class="px-4 py-2">Provider / model</th>
+          <th class="px-4 py-2">Decision</th>
+          <th class="px-4 py-2">Severity</th>
+          <th class="px-4 py-2">Findings</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-slate-900">
+        {% for e in recent %}
+        <tr class="hover:bg-slate-900/40">
+          <td class="px-4 py-2 text-slate-400">{{ e.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+          <td class="px-4 py-2">{{ e.actor_label or e.actor_kind }}</td>
+          <td class="px-4 py-2">{{ e.provider }} · <code>{{ e.model }}</code></td>
+          <td class="px-4 py-2">
+            {% set color = {'allow':'bg-emerald-700/40 text-emerald-200','redact':'bg-amber-700/40 text-amber-200','block':'bg-red-700/40 text-red-200','error':'bg-slate-700/60 text-slate-200'} %}
+            <span class="pill {{ color.get(e.decision,'bg-slate-700/60 text-slate-200') }}">{{ e.decision }}</span>
+          </td>
+          <td class="px-4 py-2">{{ e.severity }}</td>
+          <td class="px-4 py-2"><a class="text-emerald-300 hover:underline" href="/admin/event/{{ e.id }}">{{ e.findings|length }}</a></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="px-4 py-6 text-center text-slate-500">No traffic yet — point an SDK at this gateway.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<script>
+async function revokeKey(id) {
+  if (!confirm('Revoke this API key?')) return;
+  const r = await fetch('/admin/api/keys/' + id, {method: 'DELETE'});
+  if (r.ok) location.reload(); else alert('Failed to revoke');
+}
+document.getElementById('newkey').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const body = {name: fd.get('name'), user_label: fd.get('user_label') || null, scopes: ['proxy']};
+  const r = await fetch('/admin/api/keys', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  if (!r.ok) { alert('Failed: ' + await r.text()); return; }
+  const data = await r.json();
+  const out = document.getElementById('newkey-out');
+  out.textContent = 'Save this now — it will not be shown again:\n\n' + data.plaintext;
+  out.classList.remove('hidden');
+});
+document.getElementById('newcred').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const body = {provider: fd.get('provider'), api_key: fd.get('api_key'), base_url: fd.get('base_url') || null};
+  const r = await fetch('/admin/api/credentials', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  if (r.ok) location.reload(); else alert('Failed: ' + await r.text());
+});
+</script>
+{% endblock %}

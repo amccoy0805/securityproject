@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}Aegis AI Gateway — secure AI for the enterprise{% endblock %}
+{% block content %}
+<section class="grid gap-10 md:grid-cols-2 md:items-center">
+  <div>
+    <h1 class="text-4xl font-bold tracking-tight md:text-5xl">
+      Antivirus for AI usage in the enterprise.
+    </h1>
+    <p class="mt-4 text-lg text-slate-300">
+      Aegis is a single security layer that sits between your employees, your apps, and every AI provider —
+      OpenAI, Anthropic, internal models, and any OpenAI-compatible endpoint. Every prompt is classified,
+      every secret is redacted, every interaction is logged, and every compliance regime (GDPR, HIPAA, PCI)
+      is enforced before a token ever leaves your network.
+    </p>
+    <div class="mt-6 flex gap-3">
+      <a href="/login" class="rounded-md bg-emerald-500 px-4 py-2 font-medium text-slate-950 hover:bg-emerald-400">Open admin console</a>
+      <a href="/docs" class="rounded-md border border-slate-700 px-4 py-2 font-medium hover:bg-slate-900">API reference</a>
+    </div>
+  </div>
+  <div class="rounded-xl border border-slate-800 bg-slate-900/60 p-6 shadow-2xl">
+    <p class="text-xs uppercase tracking-wider text-emerald-400">Drop-in compatible</p>
+    <pre class="mt-3 overflow-x-auto rounded bg-slate-950/80 p-4 text-sm text-slate-200"><code>from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://aegis.your-company.com/v1",
+    api_key="aeg_live_********",  # issued by Aegis
+)
+
+client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user",
+               "content": "Summarise: SSN 123-45-6789, sk-abcd…"}],
+)
+# Aegis blocks/redacts the secret + SSN before the call leaves your VPC.</code></pre>
+  </div>
+</section>
+
+<section class="mt-16 grid gap-6 md:grid-cols-3">
+  {% set features = [
+    ("Data classification", "PII, PHI, PCI, secrets, credentials, internal tokens — detected per request and per response."),
+    ("Policy as code", "Compose GDPR / HIPAA / PCI / custom policies; severity-based allow / redact / block actions."),
+    ("Mediated access", "All AI traffic — SaaS, internal, third-party — is forced through one auditable proxy with one identity model."),
+    ("Tamper-evident audit", "Append-only logs of who asked what, which model answered, what was redacted, and how long it took."),
+    ("Provider-agnostic", "OpenAI, Anthropic, Azure OpenAI, vLLM, Ollama, internal endpoints — one SDK, one policy regime."),
+    ("Endpoint agent", "Lightweight local proxy for laptops and CI; no app code change required.")
+  ] %}
+  {% for title, body in features %}
+  <div class="rounded-xl border border-slate-800 bg-slate-900/40 p-5">
+    <h3 class="font-semibold text-emerald-300">{{ title }}</h3>
+    <p class="mt-2 text-sm text-slate-300">{{ body }}</p>
+  </div>
+  {% endfor %}
+</section>
+{% endblock %}

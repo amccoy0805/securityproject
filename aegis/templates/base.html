@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en" class="h-full bg-slate-950 text-slate-100">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{% block title %}Aegis AI Gateway{% endblock %}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      .pill { @apply inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium; }
+      pre { white-space: pre-wrap; word-break: break-word; }
+    </style>
+  </head>
+  <body class="min-h-full">
+    <header class="border-b border-slate-800 bg-slate-900/60 backdrop-blur">
+      <div class="mx-auto flex max-w-7xl items-center justify-between px-6 py-3">
+        <a href="/" class="flex items-center gap-2 text-lg font-semibold tracking-tight">
+          <span class="inline-block h-3 w-3 rounded-sm bg-emerald-400"></span>
+          Aegis <span class="text-slate-400 font-normal">AI Gateway</span>
+        </a>
+        <nav class="flex items-center gap-6 text-sm text-slate-300">
+          {% if ctx and ctx.user %}
+            <a href="/admin" class="hover:text-white">Overview</a>
+            <a href="/admin/audit" class="hover:text-white">Audit</a>
+            <a href="/admin/playground" class="hover:text-white">Playground</a>
+            <a href="/docs" class="hover:text-white">API Docs</a>
+            <span class="text-slate-500">{{ ctx.tenant.name }} · {{ ctx.user.email }}</span>
+            <form method="post" action="/logout">
+              <button class="rounded border border-slate-700 px-2 py-1 text-xs hover:bg-slate-800">Sign out</button>
+            </form>
+          {% else %}
+            <a href="/login" class="rounded bg-emerald-500 px-3 py-1.5 text-sm font-medium text-slate-950 hover:bg-emerald-400">Sign in</a>
+          {% endif %}
+        </nav>
+      </div>
+    </header>
+    <main class="mx-auto max-w-7xl px-6 py-8">
+      {% block content %}{% endblock %}
+    </main>
+    <footer class="border-t border-slate-800 py-6 text-center text-xs text-slate-500">
+      Aegis AI Gateway · self-hosted security layer for enterprise AI
+    </footer>
+  </body>
+</html>

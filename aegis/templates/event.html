@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}Event {{ event.request_id[:8] }} · Aegis{% endblock %}
+{% block content %}
+<a href="/admin/audit" class="text-sm text-emerald-300 hover:underline">← Back to audit log</a>
+<h1 class="mt-2 text-2xl font-semibold">Event <code class="text-emerald-300">{{ event.request_id }}</code></h1>
+
+<div class="mt-4 grid gap-4 md:grid-cols-2">
+  <div class="rounded-xl border border-slate-800 bg-slate-900/40 p-4 text-sm">
+    <p><span class="text-slate-400">When:</span> {{ event.created_at.isoformat() }}Z</p>
+    <p><span class="text-slate-400">Actor:</span> {{ event.actor_label }} ({{ event.actor_kind }})</p>
+    <p><span class="text-slate-400">Provider/model:</span> {{ event.provider }} · <code>{{ event.model }}</code></p>
+    <p><span class="text-slate-400">Route:</span> <code>{{ event.route }}</code></p>
+    <p><span class="text-slate-400">Decision:</span> {{ event.decision }} · severity {{ event.severity }}</p>
+    <p><span class="text-slate-400">Latency:</span> {{ event.latency_ms }} ms</p>
+    <p><span class="text-slate-400">Sizes:</span> input {{ event.input_chars }} chars, output {{ event.output_chars }} chars</p>
+  </div>
+  <div class="rounded-xl border border-slate-800 bg-slate-900/40 p-4 text-sm">
+    <h3 class="font-medium text-slate-200">Findings</h3>
+    {% if event.findings %}
+    <ul class="mt-2 space-y-1">
+      {% for f in event.findings %}
+      <li><span class="pill bg-slate-800">{{ f.detector }}</span> · {{ f.category }} · severity {{ f.severity }}</li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="text-slate-500">No findings.</p>
+    {% endif %}
+  </div>
+</div>
+
+<div class="mt-6 grid gap-4 md:grid-cols-2">
+  <div class="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
+    <h3 class="text-sm font-medium text-slate-200">Request excerpt</h3>
+    <pre class="mt-2 rounded bg-slate-950 p-3 text-xs text-slate-200">{{ event.request_excerpt or '— not stored (compliance) —' }}</pre>
+  </div>
+  <div class="rounded-xl border border-slate-800 bg-slate-900/40 p-4">
+    <h3 class="text-sm font-medium text-slate-200">Response excerpt</h3>
+    <pre class="mt-2 rounded bg-slate-950 p-3 text-xs text-slate-200">{{ event.response_excerpt or '— not stored (compliance) —' }}</pre>
+  </div>
+</div>
+
+<div class="mt-6 rounded-xl border border-slate-800 bg-slate-900/40 p-4">
+  <h3 class="text-sm font-medium text-slate-200">Extra metadata</h3>
+  <pre class="mt-2 rounded bg-slate-950 p-3 text-xs text-slate-200">{{ event.extra | tojson(indent=2) }}</pre>
+</div>
+{% endblock %}

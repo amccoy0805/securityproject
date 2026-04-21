@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Policy playground · Aegis{% endblock %}
+{% block content %}
+<h1 class="text-2xl font-semibold">Policy playground</h1>
+<p class="text-sm text-slate-400">Paste a prompt and see what Aegis would do — without forwarding it upstream.</p>
+
+<div class="mt-4 grid gap-4 md:grid-cols-2">
+  <div>
+    <label class="block text-sm">
+      <span class="text-slate-300">Sample prompt</span>
+      <textarea id="text" rows="14"
+                class="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs"
+                placeholder="Try: 'Customer SSN 123-45-6789 used card 4111 1111 1111 1111. Token: ghp_abcdefghijklmnopqrstuvwx1234567890ABCDEF'."></textarea>
+    </label>
+    <div class="mt-2 flex items-center gap-2 text-sm">
+      <input id="model" placeholder="model (optional)" class="rounded border border-slate-700 bg-slate-950 px-2 py-1 text-xs" />
+      <button id="go" class="rounded bg-emerald-500 px-3 py-1 font-medium text-slate-950">Evaluate</button>
+      <span id="needkey" class="text-xs text-slate-400">Uses any tenant API key from this admin session.</span>
+    </div>
+    <label class="mt-3 block text-xs text-slate-300">
+      <span class="block">Aegis API key (paste an <code>aeg_…</code> key created on the overview page):</span>
+      <input id="apikey" type="password"
+             class="mt-1 w-full rounded border border-slate-700 bg-slate-950 px-2 py-1 font-mono text-xs"
+             placeholder="aeg_live_xxxxxxxx.xxxxxxxx" />
+    </label>
+  </div>
+  <div>
+    <h3 class="text-sm font-medium text-slate-300">Result</h3>
+    <pre id="out" class="mt-2 h-[28rem] overflow-auto rounded bg-slate-950 p-3 text-xs text-slate-200">—</pre>
+  </div>
+</div>
+
+<script>
+document.getElementById('go').addEventListener('click', async () => {
+  const key = document.getElementById('apikey').value.trim();
+  if (!key) { alert('Paste an Aegis API key first.'); return; }
+  const body = {text: document.getElementById('text').value, model: document.getElementById('model').value || null, scan_response: true};
+  const r = await fetch('/v1/policy/check', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key},
+    body: JSON.stringify(body),
+  });
+  const data = await r.json();
+  document.getElementById('out').textContent = JSON.stringify(data, null, 2);
+});
+</script>
+{% endblock %}
