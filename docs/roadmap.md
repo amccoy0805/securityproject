@@ -9,23 +9,25 @@ direction for hardening it into the SaaS you'd sell to regulated enterprises.
 - **Streaming responses (SSE)** for `/v1/chat/completions` so latency parity
   with raw OpenAI is preserved. Outbound redaction becomes a streaming
   scanner.
+- **Tool-arg JSON-Schema validation**: today we hash the registered schema
+  for tamper detection; deep validation of model-emitted args against the
+  schema is the next step.
 - **ML-based detectors** plugged in alongside the regex detectors:
   - [Microsoft Presidio](https://github.com/microsoft/presidio) for
     multilingual PII.
   - LLM-judge classifier for prompt-injection signals that regex can't catch
     (paraphrased "ignore" instructions, multi-language jailbreaks).
   - In-house classifier for industry-specific PHI / IP terms.
-- **Tool-call allow-list**: when a request uses OpenAI/Anthropic tool calls,
-  enforce a tenant-defined whitelist of permitted tool names + argument
-  schemas. Blocks an injected page from telling the agent to call
-  `delete_files()`.
-- **Distributed budget store**: swap the in-memory `BudgetEnforcer` for Redis
+- **Distributed budget + loop store**: swap the in-memory enforcer for Redis
   so multi-replica deployments share counters in real time.
 - **Cost reconciliation**: post-process upstream `usage` fields to replace
   estimates with billing-grade actuals before they hit budgets.
 - **SSO**: SAML + OIDC for the admin console, SCIM for user provisioning.
 - **Postgres migrations** via Alembic.
-- **KMS-wrapped provider credentials** (AWS KMS / GCP KMS / HashiCorp Vault).
+- **KMS-wrapped envelope encryption** for the tool-credential vault and
+  upstream provider credentials (AWS KMS / GCP KMS / HashiCorp Vault). The
+  `aegis/safety/vault.py` interface is intentionally narrow so this swap
+  is one file.
 
 ## Mid-term
 

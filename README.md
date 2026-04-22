@@ -25,6 +25,14 @@ identity model regardless of upstream provider or downstream tool.
 | **Cost & rate budgets** | Always-on per-key and per-tenant budgets on requests, characters, and **estimated USD** with sane defaults; tighter per-tenant overrides via policy. Explicit `X-Aegis-Override-Budget` to proceed (logged). |
 | **Tool governance & action gating** | Tenant-scoped tool registry: unregistered tools cannot be advertised to the model and unregistered tool calls in model output are stripped. Schema-hash detection of supply-chain mutation. Action classifier (`read / write / destructive / financial / network`); destructive and financial calls require explicit `X-Aegis-Approve-Action`. Per-tool URL safety blocks SSRF (loopback, RFC1918, cloud metadata) and deny-listed domains. Per-tool monetary thresholds. |
 | **API key identity guard** | Per-key CIDR allowlist; optional first-seen-IP pin (lock the key to its first /24 or /48); `first_seen_ip` and `last_used_ip` recorded for forensics. |
+| **Agent inventory + risk scoring** | Auto-discovers every agent (from `X-Aegis-Agent` header or `(api_key, model)` tuple) and maintains a transparent 0–100 risk score per agent based on autonomy, data sensitivity, tool breadth, financial reach, destructive history, and exposure to untrusted content. |
+| **Human-readable rules engine** | Drop-in rules like `never_send_money`, `require_approval_for`, `never_share`, `block_weekends`, `business_hours_only`, `no_external_input_for_destructive`. Strictest-wins composition; consumer profile ships sensible defaults. |
+| **Async approval workflow** | Sensitive tool calls without sync approval generate a `PendingApproval` ticket; admin approves/denies from the queue; the agent re-submits with `X-Aegis-Approval-Ticket: <id>`. Tickets are single-use, time-boxed, and tool-bound. |
+| **Tool credential vault** | Per-tenant `ToolCredential` store with authenticated encryption, minimum scopes, rotation reminders, instant revoke. KMS-pluggable cipher in `aegis/safety/vault.py`. |
+| **Brand / lookalike protection** | `ProtectedDomain` registry + homoglyph (`g00gle.com`) / typo / Cyrillic (`аpple.com`) lookalike blocking on tool argument URLs. |
+| **Tamper-evident audit chain** | Every audit row carries `prev_hash` + `this_hash`; admin-callable `verify_chain` re-walks the log. |
+| **Memory protection** | New `memory_write` action class so memory-store tools (`remember`, `store_memory`, `memorize`, …) are governed like other writes — required-approval by default, defending against memory poisoning. |
+| **Consumer profile + plain-English verdicts** | `consumer` compliance profile + `aegis.verdict` block in every response (`level`, `headline`, `severity`, `details`) so a browser extension or mobile companion can render safe/unsafe explanations without understanding prompt injection. |
 | **Policy as code** | Composable compliance profiles (`baseline`, `gdpr`, `hipaa`, `pci`, `secrets-only`, `agent-safety`) plus tenant-specific overrides — severity-based `allow / redact / block`. |
 | **Mediated access** | All AI traffic flows through one proxy. Per-tenant API keys; per-tenant upstream credentials so end users never see raw OpenAI/Anthropic keys. |
 | **Tamper-evident audit** | Append-only event log of who asked what, which model answered, what was redacted, latency, sizes, estimated cost — built for SIEM ingest. |
@@ -33,9 +41,11 @@ identity model regardless of upstream provider or downstream tool.
 | **Endpoint agent** | Lightweight local proxy for laptops/CI so developer tools (Cursor, OpenCLaw, raw `curl`) hit the gateway by changing only `OPENAI_BASE_URL`. |
 
 See [`docs/architecture.md`](docs/architecture.md) for design rationale,
-[`docs/compliance.md`](docs/compliance.md) for GDPR/HIPAA/PCI mapping, and
+[`docs/compliance.md`](docs/compliance.md) for GDPR/HIPAA/PCI mapping,
 [`docs/agent-safety.md`](docs/agent-safety.md) for the agent-specific controls
-(indirect injection, loops, budgets).
+(indirect injection, loops, budgets, tool governance, approvals, IP guards),
+and [`docs/spec-audit.md`](docs/spec-audit.md) for the line-by-line audit
+against the "trust layer for agentic AI" spec.
 
 ---
 

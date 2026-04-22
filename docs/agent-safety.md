@@ -2,8 +2,15 @@
 
 This document is the comprehensive reference for the agent-safety controls
 Aegis ships. It maps directly to the everyday-user risk model (loss of
-control, data leakage, unintended actions) and covers six layers — every one
-runs on every request and writes a row to the audit log.
+control, data leakage, unintended actions) and covers eight layers — every
+one runs on every request and writes a row to the audit log.
+
+For a line-by-line audit against the "trust layer for agentic AI" spec,
+including the **agent inventory + risk score**, **human-readable rules
+engine**, **async approval workflow**, **tool credential vault**,
+**lookalike brand protection**, **memory-write protection**, **hash-chained
+audit**, and the **consumer profile + plain-English verdicts**, see
+[`spec-audit.md`](spec-audit.md).
 
 This document covers the controls Aegis ships specifically for **autonomous
 agents** (OpenCLaw / OpenDevin / LangChain / custom orchestrators) and
