@@ -1,1 +1,161 @@
-# securityproject
+# Aegis AI Gateway
+
+> **Antivirus for AI usage in the enterprise.**
+> A self-hosted security and compliance layer that mediates every AI call your
+> employees and applications make — to OpenAI, Anthropic, Azure OpenAI, internal
+> models, and any OpenAI-compatible endpoint.
+
+Aegis is the SaaS that businesses purchase so their workforce can use AI tools
+(ChatGPT, Claude, Cursor, OpenCLaw, internal copilots) **without** leaking PII,
+PHI, secrets, IP, or violating GDPR / HIPAA / PCI / SOC 2.
+
+It is designed to be the **mandatory gateway** through which all AI traffic
+flows, providing a single audit trail, a single policy regime, and a single
+identity model regardless of upstream provider or downstream tool.
+
+---
+
+## What it does
+
+| Pillar | What Aegis enforces |
+| --- | --- |
+| **Data classification** | Detects PII, PHI, PCI, secrets, credentials, internal tokens in every prompt and every response. |
+| **Indirect prompt-injection defense** | Detects instruction-overrides, role hijacks, hidden Unicode/tag stego, markdown-image data exfiltration, malicious HTML comments and scripts — in both directions. Supports an `<aegis:untrusted>…</aegis:untrusted>` channel that auto-elevates findings inside scraped/retrieved content. |
+| **Runaway-loop detection** | Per-key sliding-window detector blocks an agent that sends the same prompt 8+ times in 2 minutes. Explicit `X-Aegis-Override-Loop` to proceed (logged). |
+| **Cost & rate budgets** | Always-on per-key and per-tenant budgets on requests, characters, and **estimated USD** with sane defaults; tighter per-tenant overrides via policy. Explicit `X-Aegis-Override-Budget` to proceed (logged). |
+| **Tool governance & action gating** | Tenant-scoped tool registry: unregistered tools cannot be advertised to the model and unregistered tool calls in model output are stripped. Schema-hash detection of supply-chain mutation. Action classifier (`read / write / destructive / financial / network`); destructive and financial calls require explicit `X-Aegis-Approve-Action`. Per-tool URL safety blocks SSRF (loopback, RFC1918, cloud metadata) and deny-listed domains. Per-tool monetary thresholds. |
+| **API key identity guard** | Per-key CIDR allowlist; optional first-seen-IP pin (lock the key to its first /24 or /48); `first_seen_ip` and `last_used_ip` recorded for forensics. |
+| **Agent inventory + risk scoring** | Auto-discovers every agent (from `X-Aegis-Agent` header or `(api_key, model)` tuple) and maintains a transparent 0–100 risk score per agent based on autonomy, data sensitivity, tool breadth, financial reach, destructive history, and exposure to untrusted content. |
+| **Human-readable rules engine** | Drop-in rules like `never_send_money`, `require_approval_for`, `never_share`, `block_weekends`, `business_hours_only`, `no_external_input_for_destructive`. Strictest-wins composition; consumer profile ships sensible defaults. |
+| **Async approval workflow** | Sensitive tool calls without sync approval generate a `PendingApproval` ticket; admin approves/denies from the queue; the agent re-submits with `X-Aegis-Approval-Ticket: <id>`. Tickets are single-use, time-boxed, and tool-bound. |
+| **Tool credential vault** | Per-tenant `ToolCredential` store with authenticated encryption, minimum scopes, rotation reminders, instant revoke. KMS-pluggable cipher in `aegis/safety/vault.py`. |
+| **Brand / lookalike protection** | `ProtectedDomain` registry + homoglyph (`g00gle.com`) / typo / Cyrillic (`аpple.com`) lookalike blocking on tool argument URLs. |
+| **Tamper-evident audit chain** | Every audit row carries `prev_hash` + `this_hash`; admin-callable `verify_chain` re-walks the log. |
+| **Memory protection** | New `memory_write` action class so memory-store tools (`remember`, `store_memory`, `memorize`, …) are governed like other writes — required-approval by default, defending against memory poisoning. |
+| **Consumer profile + plain-English verdicts** | `consumer` compliance profile + `aegis.verdict` block in every response (`level`, `headline`, `severity`, `details`) so a browser extension or mobile companion can render safe/unsafe explanations without understanding prompt injection. |
+| **Tool-arg JSON-Schema validation** | Registered tool schemas are stored and every model-emitted call's args are validated against the schema; non-conforming calls are stripped with a structured reason. |
+| **LLM-judge detector slot** | Opt-in, bounded auxiliary detector that asks a separate (typically cheaper) model to vote on prompt-injection signals the regex set won't catch (paraphrased, multi-language). Soft-fails on crash. |
+| **Cost reconciliation** | When the upstream returns a `usage` block, Aegis uses the actual prompt/completion-token count to compute USD; budgets, audit, and the response envelope all carry both estimated and reconciled numbers. |
+| **Distributed budgets + loops (Redis)** | Set `AEGIS_REDIS_URL` to share enforcement state across replicas; falls back to in-memory automatically. |
+| **Streaming SSE with incremental redaction** | Forwards `text/event-stream` end-to-end; an output redactor with a sliding buffer catches secrets that straddle chunk boundaries before the client sees them. |
+| **Policy as code** | Composable compliance profiles (`baseline`, `gdpr`, `hipaa`, `pci`, `secrets-only`, `agent-safety`) plus tenant-specific overrides — severity-based `allow / redact / block`. |
+| **Mediated access** | All AI traffic flows through one proxy. Per-tenant API keys; per-tenant upstream credentials so end users never see raw OpenAI/Anthropic keys. |
+| **Tamper-evident audit** | Append-only event log of who asked what, which model answered, what was redacted, latency, sizes, estimated cost — built for SIEM ingest. |
+| **Anomaly signal** | Sliding-window block-rate tracking to surface compromised users or runaway integrations. |
+| **Provider-agnostic** | OpenAI, Anthropic, Azure OpenAI, vLLM, Ollama, internal endpoints — one SDK, one policy. |
+| **Endpoint agent** | Lightweight local proxy for laptops/CI so developer tools (Cursor, OpenCLaw, raw `curl`) hit the gateway by changing only `OPENAI_BASE_URL`. |
+
+See [`docs/architecture.md`](docs/architecture.md) for design rationale,
+[`docs/compliance.md`](docs/compliance.md) for GDPR/HIPAA/PCI mapping,
+[`docs/agent-safety.md`](docs/agent-safety.md) for the agent-specific controls
+(indirect injection, loops, budgets, tool governance, approvals, IP guards),
+and [`docs/spec-audit.md`](docs/spec-audit.md) for the line-by-line audit
+against the "trust layer for agentic AI" spec.
+
+---
+
+## Quickstart
+
+```bash
+git clone <this-repo>
+cd securityproject
+cp .env.example .env
+# edit .env — at minimum set AEGIS_SECRET_KEY and AEGIS_BOOTSTRAP_ADMIN_PASSWORD
+
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+uvicorn aegis.main:app --host 0.0.0.0 --port 8080 --reload
+```
+
+Open `http://localhost:8080/`, sign in with the bootstrap admin credentials,
+and:
+
+1. Add an upstream provider credential (your real OpenAI / Anthropic key).
+2. Generate an Aegis API key (`aeg_live_…`). **Save it** — you'll only see it once.
+3. Optionally tighten the tenant's compliance profile (`gdpr`, `hipaa`, …).
+4. Use the **Playground** to try sample prompts and see decisions live.
+
+### Drop-in OpenAI usage
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://aegis.your-company.com/v1",
+    api_key="aeg_live_xxxxxxxx.xxxxxxxxxxxxxxxxxxxxxxxx",
+)
+client.chat.completions.create(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+```
+
+### Anthropic usage (drop-in)
+
+```python
+import anthropic
+client = anthropic.Anthropic(
+    base_url="https://aegis.your-company.com",  # native /v1/messages route
+    api_key="aeg_live_…",
+)
+```
+
+### Endpoint agent (laptops / CI)
+
+```bash
+python agent/aegis_agent.py --gateway https://aegis.example.com --api-key aeg_live_… --port 11434
+export OPENAI_BASE_URL=http://127.0.0.1:11434/v1
+export OPENAI_API_KEY=anything   # ignored by the agent; gateway uses the real key
+```
+
+---
+
+## Run with Docker
+
+```bash
+docker compose up --build
+```
+
+The gateway listens on `:8080`. Persistent state lives in `./data` and audit
+logs in `./logs`.
+
+---
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q
+```
+
+---
+
+## Repository layout
+
+```
+aegis/                  # FastAPI gateway service (the SaaS)
+  policy/               # Detection, redaction, compliance profiles, decisioning
+  providers/            # OpenAI / Anthropic adapters + registry
+  routes/               # /v1/* proxy + /admin/api/* + /admin/* UI
+  templates/            # Server-rendered admin console
+sdk/aegis_client/       # Python SDK
+agent/aegis_agent.py    # Local endpoint agent
+tests/                  # Unit + integration tests
+docs/                   # Architecture, security, compliance, ops
+```
+
+---
+
+## Roadmap
+
+The current implementation is a complete, runnable MVP. See
+[`docs/roadmap.md`](docs/roadmap.md) for the path to:
+
+- Postgres + KMS-encrypted credential storage
+- Streaming response support (SSE)
+- ML-based detection (Microsoft Presidio, internal classifiers)
+- SAML / OIDC SSO + SCIM provisioning
+- Per-user / per-group quotas and budgets
+- Tamper-evident WORM audit storage
+- SOC 2 Type II evidence pack

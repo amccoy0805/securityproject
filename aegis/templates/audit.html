@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Audit · Aegis{% endblock %}
+{% block content %}
+<h1 class="text-2xl font-semibold">Audit log</h1>
+<p class="text-sm text-slate-400">Showing the most recent 200 events for {{ ctx.tenant.name }}.</p>
+
+<div class="mt-6 overflow-hidden rounded-xl border border-slate-800">
+  <table class="min-w-full divide-y divide-slate-800 text-sm">
+    <thead class="bg-slate-900/60 text-left text-xs uppercase tracking-wider text-slate-400">
+      <tr>
+        <th class="px-4 py-2">When</th>
+        <th class="px-4 py-2">Request</th>
+        <th class="px-4 py-2">Actor</th>
+        <th class="px-4 py-2">Provider / model</th>
+        <th class="px-4 py-2">Decision</th>
+        <th class="px-4 py-2">Sev</th>
+        <th class="px-4 py-2">In/Out</th>
+        <th class="px-4 py-2">Latency</th>
+        <th class="px-4 py-2">Findings</th>
+      </tr>
+    </thead>
+    <tbody class="divide-y divide-slate-900">
+      {% for e in events %}
+      <tr class="hover:bg-slate-900/40">
+        <td class="px-4 py-2 text-slate-400 whitespace-nowrap">{{ e.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+        <td class="px-4 py-2"><a class="text-emerald-300 hover:underline" href="/admin/event/{{ e.id }}"><code>{{ e.request_id[:8] }}</code></a></td>
+        <td class="px-4 py-2">{{ e.actor_label or e.actor_kind }}</td>
+        <td class="px-4 py-2">{{ e.provider }} · <code>{{ e.model }}</code></td>
+        <td class="px-4 py-2">
+          {% set color = {'allow':'bg-emerald-700/40 text-emerald-200','redact':'bg-amber-700/40 text-amber-200','block':'bg-red-700/40 text-red-200','error':'bg-slate-700/60 text-slate-200'} %}
+          <span class="pill {{ color.get(e.decision,'bg-slate-700/60 text-slate-200') }}">{{ e.decision }}</span>
+        </td>
+        <td class="px-4 py-2">{{ e.severity }}</td>
+        <td class="px-4 py-2 text-slate-400">{{ e.input_chars }} / {{ e.output_chars }}</td>
+        <td class="px-4 py-2 text-slate-400">{{ e.latency_ms }} ms</td>
+        <td class="px-4 py-2">{{ e.findings|length }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="9" class="px-4 py-6 text-center text-slate-500">Nothing here yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}
