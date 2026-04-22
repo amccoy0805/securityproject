@@ -39,6 +39,7 @@ class PolicySpec:
     loop_threshold: int = 8
     loop_window_seconds: int = 120
     model_prices: dict[str, dict[str, float]] = field(default_factory=dict)
+    tool_governance: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PolicySpec:
@@ -58,6 +59,7 @@ class PolicySpec:
             loop_threshold=int(data.get("loop_threshold", 8)),
             loop_window_seconds=int(data.get("loop_window_seconds", 120)),
             model_prices=dict(data.get("model_prices", {})),
+            tool_governance=data.get("tool_governance"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -75,6 +77,7 @@ class PolicySpec:
             "loop_threshold": self.loop_threshold,
             "loop_window_seconds": self.loop_window_seconds,
             "model_prices": dict(self.model_prices),
+            "tool_governance": self.tool_governance,
         }
 
 

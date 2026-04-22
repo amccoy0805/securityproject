@@ -54,6 +54,9 @@ class Tenant(Base):
     provider_creds: Mapped[list[ProviderCredential]] = relationship(
         back_populates="tenant", cascade="all, delete-orphan"
     )
+    tools: Mapped[list[RegisteredTool]] = relationship(
+        back_populates="tenant", cascade="all, delete-orphan"
+    )
 
 
 class User(Base):
@@ -83,6 +86,13 @@ class ApiKey(Base):
     user_label: Mapped[str | None] = mapped_column(String(200), nullable=True)
     revoked: Mapped[bool] = mapped_column(Boolean, default=False)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_used_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    first_seen_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # CIDR allow-list: comma-separated, empty = no IP restriction.
+    allowed_ips: Mapped[str] = mapped_column(String(500), default="")
+    # If true, the very first request locks first_seen_ip and any future
+    # request from a different IP is blocked unless explicitly overridden.
+    pin_first_seen_ip: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
     tenant: Mapped[Tenant] = relationship(back_populates="api_keys")
@@ -124,6 +134,36 @@ class Policy(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
 
     tenant: Mapped[Tenant] = relationship(back_populates="policies")
+
+
+class RegisteredTool(Base):
+    """A tool / function the tenant has explicitly registered.
+
+    The proxy refuses to advertise an unregistered tool to the model and
+    refuses to relay a model-emitted ``tool_call`` whose name isn't in this
+    table. ``schema_hash`` lets us detect a supply-chain mutation: if the
+    tool's argument schema changes upstream, the hash mismatch triggers a
+    block (or a "needs re-approval" warning, depending on policy).
+    """
+
+    __tablename__ = "registered_tools"
+    __table_args__ = (UniqueConstraint("tenant_id", "name", name="uq_tool_per_tenant"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"))
+    name: Mapped[str] = mapped_column(String(120))
+    description: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # read | write | destructive | financial | network
+    action_class: Mapped[str] = mapped_column(String(40), default="read")
+    schema_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    requires_approval: Mapped[bool] = mapped_column(Boolean, default=False)
+    # JSON: domain allow/deny lists, monetary cap, custom guardrails
+    config: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    tenant: Mapped[Tenant] = relationship(back_populates="tools")
 
 
 class AuditEvent(Base):

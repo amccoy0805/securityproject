@@ -11,8 +11,9 @@ from sqlalchemy import desc, func, select
 
 from ..auth import AuthContext, require_admin_user
 from ..db import session_scope
-from ..models import ApiKey, AuditEvent, Policy, ProviderCredential, Tenant, User
+from ..models import ApiKey, AuditEvent, Policy, ProviderCredential, RegisteredTool, Tenant, User
 from ..policy.profiles import COMPLIANCE_PROFILES
+from ..safety.tools import schema_hash
 from ..security import generate_api_key, hash_password
 
 router = APIRouter(prefix="/admin/api", tags=["admin"])
@@ -38,6 +39,8 @@ class ApiKeyCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     user_label: str | None = None
     scopes: list[str] = Field(default_factory=lambda: ["proxy"])
+    allowed_ips: list[str] = Field(default_factory=list)
+    pin_first_seen_ip: bool = False
 
 
 class ApiKeyOut(BaseModel):
@@ -48,11 +51,47 @@ class ApiKeyOut(BaseModel):
     user_label: str | None
     revoked: bool
     last_used_at: datetime | None
+    last_used_ip: str | None
+    first_seen_ip: str | None
+    allowed_ips: list[str]
+    pin_first_seen_ip: bool
     created_at: datetime
 
 
 class ApiKeyCreated(ApiKeyOut):
     plaintext: str
+
+
+class ApiKeyPatch(BaseModel):
+    allowed_ips: list[str] | None = None
+    pin_first_seen_ip: bool | None = None
+    user_label: str | None = None
+
+
+class RegisteredToolIn(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    description: str | None = None
+    action_class: str = "read"  # read|write|destructive|financial|network
+    enabled: bool = True
+    requires_approval: bool = False
+    schema_hash: str | None = None
+    tool_schema: dict[str, Any] | None = Field(default=None, alias="schema")  # if provided, hash is computed
+    config: dict[str, Any] = Field(default_factory=dict)
+
+    model_config = {"populate_by_name": True}
+
+
+class RegisteredToolOut(BaseModel):
+    id: str
+    name: str
+    description: str | None
+    action_class: str
+    enabled: bool
+    requires_approval: bool
+    schema_hash: str | None
+    config: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
 
 
 class UserCreate(BaseModel):
@@ -147,25 +186,30 @@ async def list_profiles(_: AuthContext = Depends(require_admin_user)) -> dict[st
 
 # ----- API keys -----
 
+def _key_to_out(k: ApiKey) -> ApiKeyOut:
+    return ApiKeyOut(
+        id=k.id,
+        name=k.name,
+        prefix=k.prefix,
+        scopes=[s for s in k.scopes.split(",") if s],
+        user_label=k.user_label,
+        revoked=k.revoked,
+        last_used_at=k.last_used_at,
+        last_used_ip=k.last_used_ip,
+        first_seen_ip=k.first_seen_ip,
+        allowed_ips=[ip.strip() for ip in (k.allowed_ips or "").split(",") if ip.strip()],
+        pin_first_seen_ip=k.pin_first_seen_ip,
+        created_at=k.created_at,
+    )
+
+
 @router.get("/keys", response_model=list[ApiKeyOut])
 async def list_keys(ctx: AuthContext = Depends(require_admin_user)) -> list[ApiKeyOut]:
     async with session_scope() as session:
         rows = await session.execute(
             select(ApiKey).where(ApiKey.tenant_id == ctx.tenant.id).order_by(desc(ApiKey.created_at))
         )
-        return [
-            ApiKeyOut(
-                id=k.id,
-                name=k.name,
-                prefix=k.prefix,
-                scopes=[s for s in k.scopes.split(",") if s],
-                user_label=k.user_label,
-                revoked=k.revoked,
-                last_used_at=k.last_used_at,
-                created_at=k.created_at,
-            )
-            for k in rows.scalars()
-        ]
+        return [_key_to_out(k) for k in rows.scalars()]
 
 
 @router.post("/keys", response_model=ApiKeyCreated, status_code=201)
@@ -181,20 +225,31 @@ async def create_key(
             secret_hash=generated.secret_hash,
             scopes=",".join(body.scopes) or "proxy",
             user_label=body.user_label,
+            allowed_ips=",".join(body.allowed_ips),
+            pin_first_seen_ip=body.pin_first_seen_ip,
         )
         session.add(key)
         await session.flush()
-        return ApiKeyCreated(
-            id=key.id,
-            name=key.name,
-            prefix=key.prefix,
-            scopes=body.scopes,
-            user_label=key.user_label,
-            revoked=False,
-            last_used_at=None,
-            created_at=key.created_at,
-            plaintext=generated.full,
-        )
+        out = _key_to_out(key)
+        return ApiKeyCreated(**out.model_dump(), plaintext=generated.full)
+
+
+@router.patch("/keys/{key_id}", response_model=ApiKeyOut)
+async def patch_key(
+    key_id: str, body: ApiKeyPatch, ctx: AuthContext = Depends(require_admin_user)
+) -> ApiKeyOut:
+    async with session_scope() as session:
+        key = await session.get(ApiKey, key_id)
+        if not key or key.tenant_id != ctx.tenant.id:
+            raise HTTPException(404, "Key not found.")
+        if body.allowed_ips is not None:
+            key.allowed_ips = ",".join(body.allowed_ips)
+        if body.pin_first_seen_ip is not None:
+            key.pin_first_seen_ip = body.pin_first_seen_ip
+        if body.user_label is not None:
+            key.user_label = body.user_label
+        session.add(key)
+        return _key_to_out(key)
 
 
 @router.delete("/keys/{key_id}")
@@ -352,6 +407,84 @@ async def delete_credential(cred_id: str, ctx: AuthContext = Depends(require_adm
             raise HTTPException(404, "Credential not found.")
         await session.delete(cred)
         return {"status": "deleted", "id": cred_id}
+
+
+# ----- registered tools -----
+
+_VALID_ACTION_CLASSES = {"read", "write", "destructive", "financial", "network"}
+
+
+def _tool_to_out(t: RegisteredTool) -> RegisteredToolOut:
+    return RegisteredToolOut(
+        id=t.id,
+        name=t.name,
+        description=t.description,
+        action_class=t.action_class,
+        enabled=t.enabled,
+        requires_approval=t.requires_approval,
+        schema_hash=t.schema_hash,
+        config=dict(t.config or {}),
+        created_at=t.created_at,
+        updated_at=t.updated_at,
+    )
+
+
+@router.get("/tools", response_model=list[RegisteredToolOut])
+async def list_tools(ctx: AuthContext = Depends(require_admin_user)) -> list[RegisteredToolOut]:
+    async with session_scope() as session:
+        rows = await session.execute(
+            select(RegisteredTool).where(RegisteredTool.tenant_id == ctx.tenant.id).order_by(RegisteredTool.name)
+        )
+        return [_tool_to_out(t) for t in rows.scalars()]
+
+
+@router.post("/tools", response_model=RegisteredToolOut, status_code=201)
+async def upsert_tool(
+    body: RegisteredToolIn, ctx: AuthContext = Depends(require_admin_user)
+) -> RegisteredToolOut:
+    if body.action_class not in _VALID_ACTION_CLASSES:
+        raise HTTPException(400, f"action_class must be one of {sorted(_VALID_ACTION_CLASSES)}.")
+    computed_hash = body.schema_hash
+    if body.tool_schema is not None:
+        computed_hash = schema_hash(body.tool_schema)
+    async with session_scope() as session:
+        existing = await session.execute(
+            select(RegisteredTool).where(
+                RegisteredTool.tenant_id == ctx.tenant.id, RegisteredTool.name == body.name
+            )
+        )
+        tool = existing.scalar_one_or_none()
+        if tool:
+            tool.description = body.description
+            tool.action_class = body.action_class
+            tool.enabled = body.enabled
+            tool.requires_approval = body.requires_approval
+            tool.schema_hash = computed_hash
+            tool.config = body.config
+        else:
+            tool = RegisteredTool(
+                tenant_id=ctx.tenant.id,
+                name=body.name,
+                description=body.description,
+                action_class=body.action_class,
+                enabled=body.enabled,
+                requires_approval=body.requires_approval,
+                schema_hash=computed_hash,
+                config=body.config,
+            )
+            session.add(tool)
+        await session.flush()
+        return _tool_to_out(tool)
+
+
+@router.delete("/tools/{tool_id}")
+async def delete_tool(tool_id: str, ctx: AuthContext = Depends(require_admin_user)) -> dict[str, str]:
+    async with session_scope() as session:
+        tool = await session.get(RegisteredTool, tool_id)
+        if not tool or tool.tenant_id != ctx.tenant.id:
+            raise HTTPException(404, "Tool not found.")
+        await session.delete(tool)
+        return {"status": "deleted", "id": tool_id}
 
 
 # ----- audit -----
