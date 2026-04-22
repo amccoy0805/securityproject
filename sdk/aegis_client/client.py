@@ -45,6 +45,8 @@ class AegisClient:
         override_loop: bool = False,
         approve_action: bool = False,
         override_ip: bool = False,
+        agent: str | None = None,
+        approval_ticket: str | None = None,
     ) -> dict[str, Any]:
         headers: dict[str, str] = {}
         if untrusted:
@@ -57,6 +59,10 @@ class AegisClient:
             headers["X-Aegis-Approve-Action"] = "1"
         if override_ip:
             headers["X-Aegis-Override-IP"] = "1"
+        if agent:
+            headers["X-Aegis-Agent"] = agent
+        if approval_ticket:
+            headers["X-Aegis-Approval-Ticket"] = approval_ticket
         resp = self._client.post(path, json=body, headers=headers or None)
         try:
             data = resp.json()
@@ -79,6 +85,8 @@ class AegisClient:
         override_budget: bool = False,
         override_loop: bool = False,
         approve_action: bool = False,
+        agent: str | None = None,
+        approval_ticket: str | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         body = {"model": model, "messages": messages, **kwargs}
@@ -89,6 +97,8 @@ class AegisClient:
             override_budget=override_budget,
             override_loop=override_loop,
             approve_action=approve_action,
+            agent=agent,
+            approval_ticket=approval_ticket,
         )
 
     def messages(
@@ -100,6 +110,8 @@ class AegisClient:
         override_budget: bool = False,
         override_loop: bool = False,
         approve_action: bool = False,
+        agent: str | None = None,
+        approval_ticket: str | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         body = {"model": model, "messages": messages, **kwargs}
@@ -110,6 +122,8 @@ class AegisClient:
             override_budget=override_budget,
             override_loop=override_loop,
             approve_action=approve_action,
+            agent=agent,
+            approval_ticket=approval_ticket,
         )
 
     def check(

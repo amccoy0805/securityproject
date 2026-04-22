@@ -29,7 +29,7 @@ from sqlalchemy import select
 from ..audit import record_event, tracker
 from ..auth import AuthContext, require_api_key
 from ..db import session_scope
-from ..models import Policy, ProviderCredential, RegisteredTool
+from ..models import Agent, Policy, ProtectedDomain, ProviderCredential, RegisteredTool
 from ..policy import (
     Decision,
     PolicyDecision,
@@ -39,11 +39,31 @@ from ..policy import (
     evaluate_inbound,
 )
 from ..policy.engine import effective_spec
+from ..policy.rules import (
+    CONSUMER_DEFAULT_RULES,
+    RuleContext,
+    RuleVerdict,
+    evaluate_all,
+    fold,
+    parse_rules,
+)
 from ..pricing import estimate_cost_usd
 from ..providers import ProviderError, get_provider
+from ..safety.agents import (
+    AgentObservation,
+    derive_agent_name,
+    fold_observation,
+    upsert_agent,
+)
+from ..safety.approvals import (
+    ApprovalRequest,
+    consume_ticket,
+    create_ticket,
+)
 from ..safety.budgets import BudgetSpec
 from ..safety.budgets import enforcer as budget_enforcer
 from ..safety.loops import detector as loop_detector
+from ..safety.network import client_ip
 from ..safety.tools import (
     ToolPolicy,
     inspect_request_tools,
@@ -72,6 +92,10 @@ async def _resolve_spec(ctx: AuthContext) -> PolicySpec:
         actions = dict(overrides["actions"]) if overrides.get("actions") else {}
         actions.setdefault("high", "redact")
         overrides["actions"] = actions
+    # If the tenant uses the 'consumer' profile and hasn't set custom rules,
+    # ship the consumer default rule pack.
+    if "consumer" in profile_names and not overrides.get("rules"):
+        overrides["rules"] = CONSUMER_DEFAULT_RULES
     return effective_spec(profile_names, overrides)
 
 
@@ -92,6 +116,14 @@ async def _resolve_registered_tools(tenant_id: str) -> dict[str, RegisteredTool]
             select(RegisteredTool).where(RegisteredTool.tenant_id == tenant_id)
         )
         return {t.name: t for t in rows.scalars()}
+
+
+async def _resolve_protected_domains(tenant_id: str) -> list[str]:
+    async with session_scope() as session:
+        rows = await session.execute(
+            select(ProtectedDomain).where(ProtectedDomain.tenant_id == tenant_id)
+        )
+        return [d.domain.lower() for d in rows.scalars()]
 
 
 def _block_response(request_id: str, decision: PolicyDecision) -> JSONResponse:
@@ -123,6 +155,26 @@ def _safety_block_response(
         }
     }
     return JSONResponse(status_code=429, content=payload)
+
+
+def _consumer_verdict(decision: str, severity: str, findings: list[Any]) -> dict[str, Any]:
+    """Plain-English explanation for B2C clients (browser ext / consumer app)."""
+    icons = {"allow": "ok", "redact": "warning", "block": "blocked", "error": "error"}
+    if decision == "block":
+        msg = "We blocked this because it looked unsafe."
+    elif decision == "redact":
+        msg = "We removed sensitive details before sending this to the AI."
+    elif decision == "error":
+        msg = "Something went wrong reaching the AI provider."
+    else:
+        msg = "Looks safe to proceed."
+    detector_names = sorted({f.get("detector") for f in findings if isinstance(f, dict) and f.get("detector")})
+    return {
+        "level": icons.get(decision, "info"),
+        "headline": msg,
+        "severity": severity,
+        "details": detector_names[:8],
+    }
 
 
 def _untrusted_from_request(request: Request) -> bool:
@@ -166,7 +218,30 @@ async def _proxy(
     override_budget = _override_from_request(request, "x-aegis-override-budget")
     override_loop = _override_from_request(request, "x-aegis-override-loop")
     approve_action = _override_from_request(request, "x-aegis-approve-action")
+    approval_ticket_id = (request.headers.get("x-aegis-approval-ticket") or "").strip()
     api_key_id = ctx.api_key.id if ctx.api_key else "no-key"
+    src_ip = client_ip(request)
+
+    # ---- Agent discovery + risk score (auto-inventory) ----
+    agent_name = derive_agent_name(
+        header_value=request.headers.get("x-aegis-agent"),
+        api_key_name=ctx.api_key.name if ctx.api_key else None,
+        model=model,
+    )
+    agent_id: str | None = None
+    async with session_scope() as session:
+        agent = await upsert_agent(
+            session,
+            tenant_id=ctx.tenant.id,
+            name=agent_name,
+            api_key_id=api_key_id if api_key_id != "no-key" else None,
+            api_key_name=ctx.api_key.name if ctx.api_key else None,
+            model=model,
+            src_ip=src_ip,
+        )
+        agent_id = agent.id
+        agent_kind = agent.kind
+        agent_autonomy = agent.autonomy
 
     # ---- Loop / runaway detection (before policy + before upstream) ----
     loop = loop_detector.observe(
@@ -197,6 +272,7 @@ async def _proxy(
                     "repeat_count": loop.repeat_count,
                     "reason": loop.reason,
                 },
+                agent_id=agent_id,
             )
         tracker.record(ctx.tenant.id, "block")
         return _safety_block_response(
@@ -246,6 +322,7 @@ async def _proxy(
                     "triggered_window": pre.triggered_window,
                     "snapshot": pre.snapshot,
                 },
+                agent_id=agent_id,
             )
         tracker.record(ctx.tenant.id, "block")
         return _safety_block_response(
@@ -266,6 +343,52 @@ async def _proxy(
             untrusted=untrusted,
         ),
     )
+
+    # ---- Human-readable rules engine ----
+    rules = parse_rules(spec.rules)
+    rule_ctx = RuleContext(
+        text=plain,
+        model=model,
+        action_classes=[],  # tool calls not yet known on the inbound side
+        detected_categories=decision.matched_categories,
+        untrusted_present=decision.untrusted_present,
+    )
+    rule_results = evaluate_all(rules, rule_ctx)
+    folded_rule = fold(rule_results)
+    if folded_rule and folded_rule.verdict == RuleVerdict.BLOCK:
+        async with session_scope() as session:
+            await record_event(
+                session,
+                tenant_id=ctx.tenant.id,
+                request_id=request_id,
+                actor_kind=ctx.actor_kind,
+                actor_id=ctx.actor_id,
+                actor_label=ctx.actor_label,
+                provider=provider_name,
+                model=model,
+                route=upstream_path,
+                decision="block",
+                severity="high",
+                findings=[r.to_dict() for r in rule_results],
+                input_text=plain,
+                output_text="",
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                store_excerpts=spec.store_request_excerpts,
+                extra={"safety": "rule_block", "rules": [r.to_dict() for r in rule_results]},
+                agent_id=agent_id,
+            )
+        tracker.record(ctx.tenant.id, "block")
+        return JSONResponse(
+            status_code=451,
+            content={
+                "error": {
+                    "type": "rule_block",
+                    "message": folded_rule.reason,
+                    "request_id": request_id,
+                    "rules": [r.to_dict() for r in rule_results],
+                }
+            },
+        )
 
     if decision.decision == Decision.BLOCK:
         async with session_scope() as session:
@@ -299,6 +422,9 @@ async def _proxy(
 
     # ---- Tool governance: validate the *advertised* tools list (inbound) ----
     tool_policy = ToolPolicy.from_dict(spec.tool_governance)
+    protected_domains = await _resolve_protected_domains(ctx.tenant.id)
+    if protected_domains:
+        tool_policy.protected_domains = sorted(set(tool_policy.protected_domains) | set(protected_domains))
     registered = await _resolve_registered_tools(ctx.tenant.id)
     inbound_tool_report = inspect_request_tools(
         request_tools=forwarded_body.get("tools") if isinstance(forwarded_body, dict) else None,
@@ -328,6 +454,7 @@ async def _proxy(
                     "safety": "tool_registry_block",
                     "reason": inbound_tool_report.reason,
                 },
+                agent_id=agent_id,
             )
         tracker.record(ctx.tenant.id, "block")
         return JSONResponse(
@@ -375,6 +502,7 @@ async def _proxy(
                 latency_ms=int((time.perf_counter() - started) * 1000),
                 store_excerpts=spec.store_request_excerpts,
                 extra={"upstream_error": str(exc)},
+                agent_id=agent_id,
             )
         tracker.record(ctx.tenant.id, "error")
         return JSONResponse(status_code=exc.status_code, content=exc.payload)
@@ -384,13 +512,60 @@ async def _proxy(
 
     # ---- Tool governance: inspect model-emitted tool calls (outbound) ----
     outbound_tool_report = None
+    issued_tickets: list[dict[str, Any]] = []
+    consumed_ticket_ok: bool | None = None
+    consumed_ticket_reason: str | None = None
+
+    # If the caller supplied an approval ticket, look it up and treat as approval.
+    effective_approval = approve_action
+    if approval_ticket_id and not effective_approval:
+        async with session_scope() as session:
+            ok, reason = await consume_ticket(
+                session,
+                tenant_id=ctx.tenant.id,
+                ticket_id=approval_ticket_id,
+                expected_tool=None,
+            )
+        consumed_ticket_ok = ok
+        consumed_ticket_reason = reason
+        effective_approval = ok
+
     if upstream.status_code < 400 and isinstance(response_body, dict):
         response_body, outbound_tool_report = inspect_response_calls(
             response_body,
             registered=registered,
             policy=tool_policy,
-            approved=approve_action,
+            approved=effective_approval,
         )
+
+        # For each call we just blocked because of "needs approval" / threshold,
+        # issue an async ticket so a human can approve out-of-band.
+        if outbound_tool_report and outbound_tool_report.blocked_calls and not effective_approval:
+            async with session_scope() as session:
+                for finding in outbound_tool_report.blocked_calls:
+                    if "approval" not in (finding.reason or "").lower() and "threshold" not in (finding.reason or "").lower():
+                        continue
+                    ticket = await create_ticket(
+                        session,
+                        ApprovalRequest(
+                            request_id=request_id,
+                            tenant_id=ctx.tenant.id,
+                            api_key_id=api_key_id if api_key_id != "no-key" else None,
+                            actor_label=ctx.actor_label,
+                            agent_id=agent_id,
+                            tool_name=finding.name,
+                            action_class=finding.action_class or "unknown",
+                            summary=finding.reason or "sensitive tool call",
+                            arguments_excerpt=finding.arguments_excerpt,
+                            risk_factors={"agent_kind": agent_kind, "agent_autonomy": agent_autonomy},
+                        ),
+                    )
+                    issued_tickets.append({
+                        "ticket_id": ticket.id,
+                        "tool": finding.name,
+                        "action_class": finding.action_class,
+                        "expires_at": ticket.expires_at.isoformat(),
+                    })
 
     outbound_findings: list = []
     if upstream.status_code < 400 and output_text:
@@ -415,6 +590,7 @@ async def _proxy(
         "outbound_findings": [f.to_dict() for f in outbound_findings],
         "untrusted_present": decision.untrusted_present,
         "policy_profiles": spec.profiles,
+        "rules": [r.to_dict() for r in rule_results],
         "usage": {
             "input_chars": actual_input_chars,
             "output_chars": actual_output_chars,
@@ -423,16 +599,33 @@ async def _proxy(
         "overrides": {
             "budget": override_budget,
             "loop": override_loop,
-            "action": approve_action,
+            "action": effective_approval,
             "ip": _override_from_request(request, "x-aegis-override-ip"),
+            "approval_ticket": (
+                {"id": approval_ticket_id, "ok": consumed_ticket_ok, "reason": consumed_ticket_reason}
+                if approval_ticket_id
+                else None
+            ),
         },
         "tool_governance": {
             "inbound": [t.to_dict() for t in inbound_tool_report.findings],
             "outbound": [t.to_dict() for t in (outbound_tool_report.findings if outbound_tool_report else [])],
             "blocked_calls": [t.to_dict() for t in (outbound_tool_report.blocked_calls if outbound_tool_report else [])],
             "sanitized": bool(outbound_tool_report and outbound_tool_report.sanitized),
+            "issued_tickets": issued_tickets,
         },
-        "client_ip": (request.client.host if request.client else None),
+        "agent": {
+            "id": agent_id,
+            "name": agent_name,
+            "kind": agent_kind,
+            "autonomy": agent_autonomy,
+        },
+        "client_ip": src_ip,
+        "verdict": _consumer_verdict(
+            final_decision,
+            (decision.severity.value if decision.severity else "info"),
+            [f.to_dict() for f in decision.findings] + [f.to_dict() for f in outbound_findings],
+        ),
     }
 
     async with session_scope() as session:
@@ -461,18 +654,40 @@ async def _proxy(
                 "matched_categories": decision.matched_categories,
                 "untrusted_present": decision.untrusted_present,
                 "estimated_cost_usd": round(actual_cost, 6),
+                "rules": [r.to_dict() for r in rule_results],
+                "issued_tickets": issued_tickets,
                 "overrides": {
                     "budget": override_budget,
                     "loop": override_loop,
-                    "action": approve_action,
+                    "action": effective_approval,
+                    "approval_ticket": approval_ticket_id or None,
                 },
                 "tool_governance": {
                     "blocked_calls": [t.to_dict() for t in (outbound_tool_report.blocked_calls if outbound_tool_report else [])],
                     "sanitized": bool(outbound_tool_report and outbound_tool_report.sanitized),
                 },
-                "client_ip": (request.client.host if request.client else None),
+                "client_ip": src_ip,
             },
+            agent_id=agent_id,
         )
+
+        # Fold this observation into the agent's running risk score.
+        ag = await session.get(Agent, agent_id) if agent_id else None
+        if ag is not None:
+            fold_observation(
+                ag,
+                AgentObservation(
+                    decision=final_decision,
+                    severity=(decision.severity.value if decision.severity else "info"),
+                    matched_categories=decision.matched_categories,
+                    untrusted_present=decision.untrusted_present,
+                    tool_action_classes=[
+                        t.action_class for t in (outbound_tool_report.findings if outbound_tool_report else [])
+                        if t.action_class
+                    ],
+                ),
+            )
+            session.add(ag)
     tracker.record(ctx.tenant.id, final_decision)
     budget_enforcer.commit(
         tenant_id=ctx.tenant.id,

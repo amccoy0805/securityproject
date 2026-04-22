@@ -9,11 +9,38 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import desc, func, select
 
+from ..audit import verify_chain
 from ..auth import AuthContext, require_admin_user
 from ..db import session_scope
-from ..models import ApiKey, AuditEvent, Policy, ProviderCredential, RegisteredTool, Tenant, User
+from ..models import (
+    Agent,
+    ApiKey,
+    AuditEvent,
+    PendingApproval,
+    Policy,
+    ProtectedDomain,
+    ProviderCredential,
+    RegisteredTool,
+    Tenant,
+    ToolCredential,
+    User,
+)
 from ..policy.profiles import COMPLIANCE_PROFILES
+from ..safety.approvals import decide as decide_approval
+from ..safety.approvals import list_pending
 from ..safety.tools import schema_hash
+from ..safety.vault import (
+    list_credentials as vault_list,
+)
+from ..safety.vault import (
+    needs_rotation,
+)
+from ..safety.vault import (
+    revoke_credential as vault_revoke_credential,
+)
+from ..safety.vault import (
+    upsert_credential as vault_upsert_credential,
+)
 from ..security import generate_api_key, hash_password
 
 router = APIRouter(prefix="/admin/api", tags=["admin"])
@@ -523,6 +550,296 @@ async def list_audit(
             for e in rows
         ]
         return {"items": items, "limit": limit, "offset": offset}
+
+
+@router.get("/audit/verify")
+async def audit_verify(ctx: AuthContext = Depends(require_admin_user)) -> dict[str, Any]:
+    """Re-walk the audit hash chain for the tenant and return verification result."""
+    async with session_scope() as session:
+        return await verify_chain(session, ctx.tenant.id)
+
+
+# ----- agents (auto-discovered inventory) -----
+
+class AgentOut(BaseModel):
+    id: str
+    name: str
+    kind: str
+    autonomy: str
+    description: str | None
+    last_seen_at: datetime | None
+    last_seen_ip: str | None
+    last_model: str | None
+    request_count: int
+    block_count: int
+    risk_score: int
+    risk_factors: dict[str, Any]
+
+
+class AgentPatch(BaseModel):
+    name: str | None = None
+    kind: str | None = None
+    autonomy: str | None = None
+    description: str | None = None
+
+
+def _agent_to_out(a: Agent) -> AgentOut:
+    return AgentOut(
+        id=a.id,
+        name=a.name,
+        kind=a.kind,
+        autonomy=a.autonomy,
+        description=a.description,
+        last_seen_at=a.last_seen_at,
+        last_seen_ip=a.last_seen_ip,
+        last_model=a.last_model,
+        request_count=a.request_count or 0,
+        block_count=a.block_count or 0,
+        risk_score=a.risk_score or 0,
+        risk_factors=dict(a.risk_factors or {}),
+    )
+
+
+@router.get("/agents", response_model=list[AgentOut])
+async def list_agents(ctx: AuthContext = Depends(require_admin_user)) -> list[AgentOut]:
+    async with session_scope() as session:
+        rows = await session.execute(
+            select(Agent).where(Agent.tenant_id == ctx.tenant.id).order_by(desc(Agent.risk_score))
+        )
+        return [_agent_to_out(a) for a in rows.scalars()]
+
+
+@router.patch("/agents/{agent_id}", response_model=AgentOut)
+async def patch_agent(
+    agent_id: str, body: AgentPatch, ctx: AuthContext = Depends(require_admin_user)
+) -> AgentOut:
+    async with session_scope() as session:
+        ag = await session.get(Agent, agent_id)
+        if not ag or ag.tenant_id != ctx.tenant.id:
+            raise HTTPException(404, "Agent not found.")
+        if body.name is not None:
+            ag.name = body.name
+        if body.kind is not None:
+            ag.kind = body.kind
+        if body.autonomy is not None:
+            if body.autonomy not in {"supervised", "semi", "autonomous"}:
+                raise HTTPException(400, "autonomy must be supervised|semi|autonomous.")
+            ag.autonomy = body.autonomy
+        if body.description is not None:
+            ag.description = body.description
+        session.add(ag)
+        return _agent_to_out(ag)
+
+
+# ----- pending approvals -----
+
+class PendingApprovalOut(BaseModel):
+    id: str
+    request_id: str
+    tool_name: str | None
+    action_class: str
+    summary: str
+    arguments_excerpt: str | None
+    actor_label: str | None
+    agent_id: str | None
+    status: str
+    created_at: datetime
+    expires_at: datetime
+    decided_by: str | None
+    decided_at: datetime | None
+
+
+class ApprovalDecision(BaseModel):
+    decision: str  # approved | denied
+
+
+def _approval_to_out(p: PendingApproval) -> PendingApprovalOut:
+    return PendingApprovalOut(
+        id=p.id,
+        request_id=p.request_id,
+        tool_name=p.tool_name,
+        action_class=p.action_class,
+        summary=p.summary,
+        arguments_excerpt=p.arguments_excerpt,
+        actor_label=p.actor_label,
+        agent_id=p.agent_id,
+        status=p.status,
+        created_at=p.created_at,
+        expires_at=p.expires_at,
+        decided_by=p.decided_by,
+        decided_at=p.decided_at,
+    )
+
+
+@router.get("/approvals", response_model=list[PendingApprovalOut])
+async def approvals_pending(ctx: AuthContext = Depends(require_admin_user)) -> list[PendingApprovalOut]:
+    async with session_scope() as session:
+        rows = await list_pending(session, ctx.tenant.id)
+        return [_approval_to_out(p) for p in rows]
+
+
+@router.post("/approvals/{ticket_id}", response_model=PendingApprovalOut)
+async def approvals_decide(
+    ticket_id: str, body: ApprovalDecision, ctx: AuthContext = Depends(require_admin_user)
+) -> PendingApprovalOut:
+    if body.decision not in {"approved", "denied"}:
+        raise HTTPException(400, "decision must be 'approved' or 'denied'.")
+    async with session_scope() as session:
+        decided = await decide_approval(
+            session,
+            tenant_id=ctx.tenant.id,
+            ticket_id=ticket_id,
+            decision=body.decision,
+            decided_by=ctx.user.email if ctx.user else "system",
+        )
+        if not decided:
+            raise HTTPException(404, "Approval ticket not found.")
+        return _approval_to_out(decided)
+
+
+# ----- tool credential vault -----
+
+class ToolCredentialIn(BaseModel):
+    tool_name: str
+    label: str = "default"
+    secret: str
+    kind: str = "api_key"
+    scopes: list[str] = Field(default_factory=list)
+    expires_at: datetime | None = None
+    rotation_period_days: int | None = None
+
+
+class ToolCredentialOut(BaseModel):
+    id: str
+    tool_name: str
+    label: str
+    kind: str
+    scopes: list[str]
+    expires_at: datetime | None
+    rotation_period_days: int | None
+    revoked: bool
+    revoked_at: datetime | None
+    revoked_reason: str | None
+    last_used_at: datetime | None
+    needs_rotation: bool
+
+
+def _cred_to_out(c: ToolCredential) -> ToolCredentialOut:
+    return ToolCredentialOut(
+        id=c.id,
+        tool_name=c.tool_name,
+        label=c.label,
+        kind=c.kind,
+        scopes=[s for s in (c.scopes or "").split(",") if s],
+        expires_at=c.expires_at,
+        rotation_period_days=c.rotation_period_days,
+        revoked=c.revoked,
+        revoked_at=c.revoked_at,
+        revoked_reason=c.revoked_reason,
+        last_used_at=c.last_used_at,
+        needs_rotation=needs_rotation(c),
+    )
+
+
+@router.get("/vault", response_model=list[ToolCredentialOut])
+async def vault_list_endpoint(ctx: AuthContext = Depends(require_admin_user)) -> list[ToolCredentialOut]:
+    async with session_scope() as session:
+        rows = await vault_list(session, ctx.tenant.id)
+        return [_cred_to_out(c) for c in rows]
+
+
+@router.post("/vault", response_model=ToolCredentialOut, status_code=201)
+async def vault_upsert(
+    body: ToolCredentialIn, ctx: AuthContext = Depends(require_admin_user)
+) -> ToolCredentialOut:
+    async with session_scope() as session:
+        cred = await vault_upsert_credential(
+            session,
+            tenant_id=ctx.tenant.id,
+            tool_name=body.tool_name,
+            label=body.label,
+            secret=body.secret,
+            kind=body.kind,
+            scopes=body.scopes,
+            expires_at=body.expires_at,
+            rotation_period_days=body.rotation_period_days,
+        )
+        return _cred_to_out(cred)
+
+
+@router.post("/vault/{cred_id}/revoke", response_model=ToolCredentialOut)
+async def vault_revoke(
+    cred_id: str,
+    body: dict[str, Any] | None = None,
+    ctx: AuthContext = Depends(require_admin_user),
+) -> ToolCredentialOut:
+    reason = (body or {}).get("reason")
+    async with session_scope() as session:
+        cred = await vault_revoke_credential(
+            session, tenant_id=ctx.tenant.id, cred_id=cred_id, reason=reason
+        )
+        if not cred:
+            raise HTTPException(404, "Credential not found.")
+        return _cred_to_out(cred)
+
+
+# ----- protected (brand) domains -----
+
+class ProtectedDomainIn(BaseModel):
+    domain: str
+    description: str | None = None
+
+
+class ProtectedDomainOut(BaseModel):
+    id: str
+    domain: str
+    description: str | None
+    created_at: datetime
+
+
+@router.get("/protected-domains", response_model=list[ProtectedDomainOut])
+async def list_protected_domains(ctx: AuthContext = Depends(require_admin_user)) -> list[ProtectedDomainOut]:
+    async with session_scope() as session:
+        rows = await session.execute(
+            select(ProtectedDomain).where(ProtectedDomain.tenant_id == ctx.tenant.id).order_by(ProtectedDomain.domain)
+        )
+        return [
+            ProtectedDomainOut(id=p.id, domain=p.domain, description=p.description, created_at=p.created_at)
+            for p in rows.scalars()
+        ]
+
+
+@router.post("/protected-domains", response_model=ProtectedDomainOut, status_code=201)
+async def add_protected_domain(
+    body: ProtectedDomainIn, ctx: AuthContext = Depends(require_admin_user)
+) -> ProtectedDomainOut:
+    async with session_scope() as session:
+        existing = await session.execute(
+            select(ProtectedDomain).where(
+                ProtectedDomain.tenant_id == ctx.tenant.id,
+                ProtectedDomain.domain == body.domain.lower(),
+            )
+        )
+        if existing.scalar_one_or_none():
+            raise HTTPException(409, "Domain already protected.")
+        p = ProtectedDomain(
+            tenant_id=ctx.tenant.id, domain=body.domain.lower(), description=body.description
+        )
+        session.add(p)
+        await session.flush()
+        return ProtectedDomainOut(id=p.id, domain=p.domain, description=p.description, created_at=p.created_at)
+
+
+@router.delete("/protected-domains/{pd_id}")
+async def delete_protected_domain(
+    pd_id: str, ctx: AuthContext = Depends(require_admin_user)
+) -> dict[str, str]:
+    async with session_scope() as session:
+        p = await session.get(ProtectedDomain, pd_id)
+        if not p or p.tenant_id != ctx.tenant.id:
+            raise HTTPException(404, "Protected domain not found.")
+        await session.delete(p)
+        return {"status": "deleted", "id": pd_id}
 
 
 @router.get("/dashboard/summary")

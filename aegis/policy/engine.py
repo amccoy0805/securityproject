@@ -40,6 +40,7 @@ class PolicySpec:
     loop_window_seconds: int = 120
     model_prices: dict[str, dict[str, float]] = field(default_factory=dict)
     tool_governance: dict[str, Any] | None = None
+    rules: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PolicySpec:
@@ -60,6 +61,7 @@ class PolicySpec:
             loop_window_seconds=int(data.get("loop_window_seconds", 120)),
             model_prices=dict(data.get("model_prices", {})),
             tool_governance=data.get("tool_governance"),
+            rules=list(data.get("rules", [])),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -78,6 +80,7 @@ class PolicySpec:
             "loop_window_seconds": self.loop_window_seconds,
             "model_prices": dict(self.model_prices),
             "tool_governance": self.tool_governance,
+            "rules": list(self.rules),
         }
 
 

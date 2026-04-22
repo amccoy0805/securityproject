@@ -28,3 +28,7 @@ select = ["E", "F", "I", "B", "UP"]
 # B008 is FastAPI's standard Depends() pattern; UP007 wants `X | Y` everywhere
 # but pydantic + SQLAlchemy 2 still benefit from explicit Optional in places.
 ignore = ["E501", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+# pytest fixtures imported from sibling modules look like F811 redefinitions.
+"tests/**/*.py" = ["F811"]

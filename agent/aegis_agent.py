@@ -45,7 +45,8 @@ def build_app(gateway: str, api_key: str, hostname: str) -> FastAPI:
         for h in (
             "openai-organization", "openai-project", "anthropic-version", "anthropic-beta",
             "x-aegis-untrusted", "x-aegis-override-budget", "x-aegis-override-loop",
-            "x-aegis-approve-action", "x-aegis-override-ip",
+            "x-aegis-approve-action", "x-aegis-override-ip", "x-aegis-agent",
+            "x-aegis-approval-ticket",
         ):
             v = request.headers.get(h)
             if v:
