@@ -56,6 +56,7 @@ def _split_messages(text: str, original: list[dict[str, Any]]) -> list[dict[str,
 
 class OpenAIAdapter(ProviderAdapter):
     name = "openai"
+    supports_streaming = True
 
     def extract_text(self, body: dict[str, Any]) -> str:
         if "messages" in body and isinstance(body["messages"], list):
@@ -136,3 +137,31 @@ class OpenAIAdapter(ProviderAdapter):
         except ValueError:
             data = {"error": {"message": resp.text or "Upstream returned non-JSON response."}}
         return ProviderResponse(status_code=resp.status_code, body=data, headers=dict(resp.headers))
+
+    async def forward_stream(self, path: str, body: dict[str, Any], extra_headers: dict[str, str]):
+        if not self.api_key:
+            raise ProviderError("OpenAI API key is not configured for this tenant.", status_code=412)
+        url = f"{self.base_url}/{path.lstrip('/')}"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        for k, v in extra_headers.items():
+            if k.lower() in {"openai-organization", "openai-project"}:
+                headers[k] = v
+        client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0))
+        try:
+            async with client.stream("POST", url, json=body, headers=headers) as resp:
+                if resp.status_code >= 400:
+                    raw = await resp.aread()
+                    raise ProviderError(
+                        f"Upstream returned HTTP {resp.status_code}",
+                        status_code=resp.status_code,
+                        payload={"error": {"message": raw.decode("utf-8", "replace")}},
+                    )
+                async for chunk in resp.aiter_bytes():
+                    if chunk:
+                        yield chunk
+        finally:
+            await client.aclose()

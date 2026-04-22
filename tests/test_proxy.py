@@ -376,6 +376,89 @@ def test_proxy_strips_destructive_outbound_tool_call(client, monkeypatch):
     assert data2["aegis"]["overrides"]["action"] is True
 
 
+def test_proxy_streams_sse_and_redacts_split_secret(client, monkeypatch):
+    """End-to-end SSE: token split across two upstream chunks is redacted before delivery."""
+    _set_creds(client)
+    key = _create_key(client)
+
+    import httpx as _httpx
+
+    class _StreamTransport(_httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            # Emit the secret across two SSE events to exercise the lookahead.
+            chunks = [
+                b'data: {"choices":[{"index":0,"delta":{"content":"your token: ghp_aaaaaaaaaaaaaaaaaa"}}]}\n\n',
+                b'data: {"choices":[{"index":0,"delta":{"content":"aaaaaaaaaaaaaaaaaaaa end"}}]}\n\n',
+                b'data: {"usage":{"prompt_tokens":3,"completion_tokens":12,"total_tokens":15}}\n\n',
+                b'data: [DONE]\n\n',
+            ]
+
+            async def body():
+                for c in chunks:
+                    yield c
+
+            return _httpx.Response(
+                200,
+                stream=_httpx.AsyncByteStream(body()) if hasattr(_httpx, "AsyncByteStream") else body(),
+                headers={"content-type": "text/event-stream"},
+            )
+
+    # Simpler path: implement our own AsyncByteStream.
+    class _ByteStream(_httpx.AsyncByteStream):
+        def __init__(self, chunks):
+            self._chunks = chunks
+
+        async def __aiter__(self):
+            for c in self._chunks:
+                yield c
+
+        async def aclose(self):
+            return None
+
+    class _StreamTransport2(_httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            chunks = [
+                b'data: {"choices":[{"index":0,"delta":{"content":"token: ghp_aaaaaaaaaaaaaaaaaa"}}]}\n\n',
+                b'data: {"choices":[{"index":0,"delta":{"content":"aaaaaaaaaaaaaaaaaaaa end"}}]}\n\n',
+                b'data: {"usage":{"prompt_tokens":3,"completion_tokens":12,"total_tokens":15}}\n\n',
+                b'data: [DONE]\n\n',
+            ]
+            return _httpx.Response(
+                200,
+                stream=_ByteStream(chunks),
+                headers={"content-type": "text/event-stream"},
+            )
+
+    real = _httpx.AsyncClient.__init__
+
+    def patched(self, *a, **kw):
+        kw["transport"] = _StreamTransport2()
+        real(self, *a, **kw)
+    monkeypatch.setattr(_httpx.AsyncClient, "__init__", patched)
+
+    body = {
+        "model": "gpt-4o-mini",
+        "stream": True,
+        "messages": [{"role": "user", "content": "give me my token"}],
+    }
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "X-Aegis-Override-Loop": "1",
+        "X-Aegis-Override-Budget": "1",
+    }
+    with client.stream("POST", "/v1/chat/completions", json=body, headers=headers) as r:
+        assert r.status_code == 200, r.read()
+        assert r.headers["content-type"].startswith("text/event-stream")
+        assert r.headers.get("x-aegis-streaming") == "true"
+        chunks = []
+        for raw in r.iter_bytes():
+            chunks.append(raw)
+        full = b"".join(chunks).decode("utf-8")
+    assert "ghp_" not in full, full
+    assert "[REDACTED:SECRET]" in full
+    assert "[DONE]" in full
+
+
 def test_proxy_llm_judge_can_block_on_paraphrased_injection(client, monkeypatch, mock_transport):
     """Static judge votes 'injection' → request is blocked even though regex misses it."""
     from aegis.policy.llm_judge import JudgeVerdict, StaticJudge
@@ -786,7 +869,8 @@ def test_async_approval_ticket_workflow(client, monkeypatch):
     )
     assert r3.status_code == 200
     aegis = r3.json()["aegis"]
-    assert aegis["overrides"]["approval_ticket"]["ok"] is True
+    assert aegis["overrides"]["approval_ticket"] is not None, aegis["overrides"]
+    assert aegis["overrides"]["approval_ticket"]["ok"] is True, aegis["overrides"]["approval_ticket"]
     assert r3.json()["choices"][0]["message"]["tool_calls"]
 
 

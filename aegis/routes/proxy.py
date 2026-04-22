@@ -23,7 +23,7 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import select
 
 from ..audit import record_event, tracker
@@ -53,6 +53,14 @@ from ..policy.rules import (
     evaluate_all,
     fold,
     parse_rules,
+)
+from ..policy.streaming import (
+    SSE_DONE,
+    StreamingRedactor,
+    extract_delta_text,
+    parse_openai_sse_chunk,
+    rewrite_delta_text,
+    serialise_sse_event,
 )
 from ..pricing import cost_from_usage, estimate_cost_usd, normalise_usage
 from ..providers import ProviderError, get_provider
@@ -142,6 +150,267 @@ def _build_judge(spec: PolicySpec) -> tuple[LLMJudge, JudgeConfig] | None:
         return (judge, cfg) if judge is not None else None
     settings = get_settings()
     return OpenAIJudge(api_key=settings.openai_api_key, base_url=settings.openai_base_url), cfg
+
+
+async def _stream_response(
+    *,
+    request_id: str,
+    started: float,
+    adapter,
+    upstream_path: str,
+    forwarded_body: dict[str, Any],
+    forward_headers: dict[str, str],
+    ctx: AuthContext,
+    spec: PolicySpec,
+    decision: PolicyDecision,
+    inbound_tool_report,
+    agent_id: str | None,
+    agent_name: str,
+    agent_kind: str,
+    agent_autonomy: str,
+    api_key_id: str,
+    provider_name: str,
+    model: str | None,
+    plain: str,
+    actual_input_chars: int,
+    override_budget: bool,
+    override_loop: bool,
+    effective_approval: bool,
+    approval_ticket_id: str,
+    consumed_ticket_ok: bool | None,
+    consumed_ticket_reason: str | None,
+    judge_verdict_dict: dict[str, Any] | None,
+    rule_results,
+    src_ip: str | None,
+) -> StreamingResponse:
+    """SSE forwarder with incremental output redaction.
+
+    Each upstream chunk is split into one or more events, the assistant text
+    deltas are fed into a ``StreamingRedactor`` that maintains a small
+    sliding buffer (so secrets straddling chunk boundaries are still
+    caught), and the rewritten events are emitted to the client in the same
+    SSE shape. Tool-call deltas are passed through unchanged in this MVP;
+    the registered-tool gate already ran on the request side.
+
+    On stream end (or upstream error) we:
+    - record the audit event with reconciled cost when usage was emitted,
+    - commit the actual usage to the budget enforcer,
+    - update the agent's risk observation (now also reflects redactions
+      done during the stream).
+    """
+    redactor = StreamingRedactor(
+        enabled=spec.redact_response,
+        enabled_categories=spec.categories or None,
+    )
+    output_text_collected: list[str] = []
+    upstream_usage: dict[str, Any] | None = None
+    upstream_status_holder = {"status": 200}
+
+    async def gen():
+        nonlocal upstream_usage
+        try:
+            async for chunk in adapter.forward_stream(upstream_path, forwarded_body, forward_headers):
+                events = parse_openai_sse_chunk(chunk)
+                if not events:
+                    # Pass through anything we couldn't parse (comments,
+                    # heartbeats) untouched.
+                    yield chunk
+                    continue
+                for ev in events:
+                    if isinstance(ev, dict) and "usage" in ev and isinstance(ev["usage"], dict):
+                        upstream_usage = ev["usage"]
+                    delta = extract_delta_text(ev) if isinstance(ev, dict) else ""
+                    if not delta:
+                        # No text delta to scan; forward the event as-is.
+                        yield serialise_sse_event(ev)
+                        continue
+                    safe_text, _findings = redactor.feed(delta)
+                    if safe_text:
+                        output_text_collected.append(safe_text)
+                        yield serialise_sse_event(rewrite_delta_text(ev, safe_text))
+                    # If the safe-tail kept everything in the buffer this
+                    # round, we don't emit anything for this chunk; that's
+                    # fine — we'll catch up on subsequent chunks or in
+                    # flush().
+            # Drain any tail still in the buffer.
+            tail, _ = redactor.flush()
+            if tail:
+                output_text_collected.append(tail)
+                yield serialise_sse_event(
+                    {"choices": [{"index": 0, "delta": {"content": tail}, "finish_reason": None}]}
+                )
+            yield SSE_DONE
+        except ProviderError as exc:
+            upstream_status_holder["status"] = exc.status_code
+            import json as _json
+            yield (
+                "event: error\ndata: "
+                + _json.dumps(
+                    {
+                        "error": {
+                            "type": "upstream_error",
+                            "message": str(exc),
+                            "request_id": request_id,
+                        }
+                    }
+                )
+                + "\n\n"
+            ).encode("utf-8")
+            yield SSE_DONE
+        finally:
+            await _finalise_stream(
+                request_id=request_id,
+                started=started,
+                ctx=ctx,
+                spec=spec,
+                decision=decision,
+                inbound_tool_report=inbound_tool_report,
+                agent_id=agent_id,
+                agent_name=agent_name,
+                agent_kind=agent_kind,
+                agent_autonomy=agent_autonomy,
+                api_key_id=api_key_id,
+                provider_name=provider_name,
+                upstream_path=upstream_path,
+                model=model,
+                plain=plain,
+                actual_input_chars=actual_input_chars,
+                output_text="".join(output_text_collected),
+                outbound_findings=redactor.all_findings,
+                upstream_usage=upstream_usage,
+                upstream_status=upstream_status_holder["status"],
+                override_budget=override_budget,
+                override_loop=override_loop,
+                effective_approval=effective_approval,
+                approval_ticket_id=approval_ticket_id,
+                consumed_ticket_ok=consumed_ticket_ok,
+                consumed_ticket_reason=consumed_ticket_reason,
+                judge_verdict_dict=judge_verdict_dict,
+                rule_results=rule_results,
+                src_ip=src_ip,
+            )
+
+    headers = {
+        "X-Aegis-Request-Id": request_id,
+        "X-Aegis-Streaming": "true",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+    }
+    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
+
+
+async def _finalise_stream(
+    *,
+    request_id: str,
+    started: float,
+    ctx: AuthContext,
+    spec: PolicySpec,
+    decision: PolicyDecision,
+    inbound_tool_report,
+    agent_id: str | None,
+    agent_name: str,
+    agent_kind: str,
+    agent_autonomy: str,
+    api_key_id: str,
+    provider_name: str,
+    upstream_path: str,
+    model: str | None,
+    plain: str,
+    actual_input_chars: int,
+    output_text: str,
+    outbound_findings,
+    upstream_usage: dict[str, Any] | None,
+    upstream_status: int,
+    override_budget: bool,
+    override_loop: bool,
+    effective_approval: bool,
+    approval_ticket_id: str,
+    consumed_ticket_ok: bool | None,
+    consumed_ticket_reason: str | None,
+    judge_verdict_dict: dict[str, Any] | None,
+    rule_results,
+    src_ip: str | None,
+) -> None:
+    """Audit + budget bookkeeping after a streaming response finishes."""
+    actual_output_chars = len(output_text)
+    reconciled = cost_from_usage(model, upstream_usage, overrides=spec.model_prices)
+    estimated = estimate_cost_usd(model, actual_input_chars, actual_output_chars,
+                                  overrides=spec.model_prices)
+    actual_cost = reconciled if reconciled is not None else estimated
+    cost_source = "reconciled" if reconciled is not None else "estimated"
+
+    final_decision = decision.decision.value if upstream_status < 400 else "error"
+    if outbound_findings and final_decision == "allow":
+        final_decision = "redact"
+
+    enforcer, _ = get_runtime()
+
+    async with session_scope() as session:
+        await record_event(
+            session,
+            tenant_id=ctx.tenant.id,
+            request_id=request_id,
+            actor_kind=ctx.actor_kind,
+            actor_id=ctx.actor_id,
+            actor_label=ctx.actor_label,
+            provider=provider_name,
+            model=model,
+            route=upstream_path,
+            decision=final_decision,
+            severity=(decision.severity.value if decision.severity else "info"),
+            findings=[f.to_dict() for f in decision.findings]
+            + [f.to_dict() for f in outbound_findings]
+            + [t.to_dict() for t in inbound_tool_report.findings],
+            input_text=plain,
+            output_text=output_text,
+            latency_ms=int((time.perf_counter() - started) * 1000),
+            store_excerpts=spec.store_request_excerpts,
+            extra={
+                "upstream_status": upstream_status,
+                "matched_categories": decision.matched_categories,
+                "untrusted_present": decision.untrusted_present,
+                "estimated_cost_usd": round(actual_cost, 6),
+                "cost_source": cost_source,
+                "tokens": normalise_usage(upstream_usage),
+                "rules": [r.to_dict() for r in rule_results],
+                "issued_tickets": [],
+                "overrides": {
+                    "budget": override_budget,
+                    "loop": override_loop,
+                    "action": effective_approval,
+                    "approval_ticket": approval_ticket_id or None,
+                },
+                "tool_governance": {
+                    "blocked_calls": [],
+                    "sanitized": False,
+                },
+                "client_ip": src_ip,
+                "streaming": True,
+                "judge": judge_verdict_dict,
+            },
+            agent_id=agent_id,
+        )
+        ag = await session.get(Agent, agent_id) if agent_id else None
+        if ag is not None:
+            fold_observation(
+                ag,
+                AgentObservation(
+                    decision=final_decision,
+                    severity=(decision.severity.value if decision.severity else "info"),
+                    matched_categories=decision.matched_categories,
+                    untrusted_present=decision.untrusted_present,
+                    tool_action_classes=[],
+                ),
+            )
+            session.add(ag)
+    tracker.record(ctx.tenant.id, final_decision)
+    enforcer.commit(
+        tenant_id=ctx.tenant.id,
+        api_key_id=api_key_id,
+        input_chars=actual_input_chars,
+        output_chars=actual_output_chars,
+        cost_usd=actual_cost,
+    )
 
 
 async def _resolve_protected_domains(tenant_id: str) -> list[str]:
@@ -244,9 +513,29 @@ async def _proxy(
     override_budget = _override_from_request(request, "x-aegis-override-budget")
     override_loop = _override_from_request(request, "x-aegis-override-loop")
     approve_action = _override_from_request(request, "x-aegis-approve-action")
-    approval_ticket_id = (request.headers.get("x-aegis-approval-ticket") or "").strip()
+    approval_ticket_id = (
+        request.headers.get("x-aegis-approval-ticket")
+        or request.headers.get("X-Aegis-Approval-Ticket")
+        or ""
+    ).strip()
     api_key_id = ctx.api_key.id if ctx.api_key else "no-key"
     src_ip = client_ip(request)
+    # Resolve any approval ticket up front so both streaming and non-streaming
+    # paths see the same `effective_approval` flag.
+    effective_approval = approve_action
+    consumed_ticket_ok: bool | None = None
+    consumed_ticket_reason: str | None = None
+    if approval_ticket_id and not effective_approval:
+        async with session_scope() as session:
+            ok, reason = await consume_ticket(
+                session,
+                tenant_id=ctx.tenant.id,
+                ticket_id=approval_ticket_id,
+                expected_tool=None,
+            )
+        consumed_ticket_ok = ok
+        consumed_ticket_reason = reason
+        effective_approval = ok
 
     # ---- Agent discovery + risk score (auto-inventory) ----
     agent_name = derive_agent_name(
@@ -534,6 +823,40 @@ async def _proxy(
         if k.lower() in {"openai-organization", "openai-project", "anthropic-version", "anthropic-beta"}
     }
 
+    # ---- Streaming branch (SSE) ----
+    wants_stream = bool(forwarded_body.get("stream")) if isinstance(forwarded_body, dict) else False
+    if wants_stream and getattr(adapter, "supports_streaming", False):
+        return await _stream_response(
+            request_id=request_id,
+            started=started,
+            adapter=adapter,
+            upstream_path=upstream_path,
+            forwarded_body=forwarded_body,
+            forward_headers=forward_headers,
+            ctx=ctx,
+            spec=spec,
+            decision=decision,
+            inbound_tool_report=inbound_tool_report,
+            agent_id=agent_id,
+            agent_name=agent_name,
+            agent_kind=agent_kind,
+            agent_autonomy=agent_autonomy,
+            api_key_id=api_key_id,
+            provider_name=provider_name,
+            model=model,
+            plain=plain,
+            actual_input_chars=len(plain or ""),
+            override_budget=override_budget,
+            override_loop=override_loop,
+            effective_approval=effective_approval,
+            approval_ticket_id=approval_ticket_id,
+            consumed_ticket_ok=consumed_ticket_ok,
+            consumed_ticket_reason=consumed_ticket_reason,
+            judge_verdict_dict=judge_verdict_dict,
+            rule_results=rule_results,
+            src_ip=src_ip,
+        )
+
     try:
         upstream = await adapter.forward(upstream_path, forwarded_body, forward_headers)
     except ProviderError as exc:
@@ -567,22 +890,6 @@ async def _proxy(
     # ---- Tool governance: inspect model-emitted tool calls (outbound) ----
     outbound_tool_report = None
     issued_tickets: list[dict[str, Any]] = []
-    consumed_ticket_ok: bool | None = None
-    consumed_ticket_reason: str | None = None
-
-    # If the caller supplied an approval ticket, look it up and treat as approval.
-    effective_approval = approve_action
-    if approval_ticket_id and not effective_approval:
-        async with session_scope() as session:
-            ok, reason = await consume_ticket(
-                session,
-                tenant_id=ctx.tenant.id,
-                ticket_id=approval_ticket_id,
-                expected_tool=None,
-            )
-        consumed_ticket_ok = ok
-        consumed_ticket_reason = reason
-        effective_approval = ok
 
     if upstream.status_code < 400 and isinstance(response_body, dict):
         response_body, outbound_tool_report = inspect_response_calls(

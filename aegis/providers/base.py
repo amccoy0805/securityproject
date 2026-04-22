@@ -59,3 +59,14 @@ class ProviderAdapter(ABC):
 
     @abstractmethod
     async def forward(self, path: str, body: dict[str, Any], extra_headers: dict[str, str]) -> ProviderResponse: ...
+
+    # -- streaming -------------------------------------------------------------
+
+    supports_streaming: bool = False
+
+    async def forward_stream(self, path: str, body: dict[str, Any], extra_headers: dict[str, str]):  # pragma: no cover
+        """Async iterator of raw SSE bytes from the upstream.
+
+        Override in adapters that opt in by setting ``supports_streaming = True``.
+        """
+        raise NotImplementedError("provider does not support streaming yet")

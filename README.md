@@ -33,6 +33,11 @@ identity model regardless of upstream provider or downstream tool.
 | **Tamper-evident audit chain** | Every audit row carries `prev_hash` + `this_hash`; admin-callable `verify_chain` re-walks the log. |
 | **Memory protection** | New `memory_write` action class so memory-store tools (`remember`, `store_memory`, `memorize`, …) are governed like other writes — required-approval by default, defending against memory poisoning. |
 | **Consumer profile + plain-English verdicts** | `consumer` compliance profile + `aegis.verdict` block in every response (`level`, `headline`, `severity`, `details`) so a browser extension or mobile companion can render safe/unsafe explanations without understanding prompt injection. |
+| **Tool-arg JSON-Schema validation** | Registered tool schemas are stored and every model-emitted call's args are validated against the schema; non-conforming calls are stripped with a structured reason. |
+| **LLM-judge detector slot** | Opt-in, bounded auxiliary detector that asks a separate (typically cheaper) model to vote on prompt-injection signals the regex set won't catch (paraphrased, multi-language). Soft-fails on crash. |
+| **Cost reconciliation** | When the upstream returns a `usage` block, Aegis uses the actual prompt/completion-token count to compute USD; budgets, audit, and the response envelope all carry both estimated and reconciled numbers. |
+| **Distributed budgets + loops (Redis)** | Set `AEGIS_REDIS_URL` to share enforcement state across replicas; falls back to in-memory automatically. |
+| **Streaming SSE with incremental redaction** | Forwards `text/event-stream` end-to-end; an output redactor with a sliding buffer catches secrets that straddle chunk boundaries before the client sees them. |
 | **Policy as code** | Composable compliance profiles (`baseline`, `gdpr`, `hipaa`, `pci`, `secrets-only`, `agent-safety`) plus tenant-specific overrides — severity-based `allow / redact / block`. |
 | **Mediated access** | All AI traffic flows through one proxy. Per-tenant API keys; per-tenant upstream credentials so end users never see raw OpenAI/Anthropic keys. |
 | **Tamper-evident audit** | Append-only event log of who asked what, which model answered, what was redacted, latency, sizes, estimated cost — built for SIEM ingest. |

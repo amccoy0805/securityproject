@@ -4,24 +4,40 @@ This MVP is intentionally small but complete: it can be deployed today and
 will enforce real policy on real AI traffic. The items below describe the
 direction for hardening it into the SaaS you'd sell to regulated enterprises.
 
-## Near-term
+## Done in the most recent revision
 
-- **Streaming responses (SSE)** for `/v1/chat/completions` so latency parity
-  with raw OpenAI is preserved. Outbound redaction becomes a streaming
-  scanner.
-- **Tool-arg JSON-Schema validation**: today we hash the registered schema
-  for tamper detection; deep validation of model-emitted args against the
-  schema is the next step.
+- ✅ **Tool-arg JSON-Schema validation** (`aegis/safety/schema_validate.py`):
+  registered tool schemas are stored, and every model-emitted call has its
+  args validated against `parameters` / `input_schema`. Malformed or
+  schema-violating calls are stripped from the response with a structured
+  reason.
+- ✅ **Cost reconciliation** (`aegis/pricing.py::cost_from_usage`): the
+  proxy reads upstream `usage` (OpenAI prompt/completion or Anthropic
+  input/output tokens) and uses the reconciled USD figure for budget
+  commits and the audit log; pre-flight checks still use the conservative
+  estimate. Both numbers + the cost source land in the response envelope
+  (`aegis.usage.{estimated_cost_usd, reconciled_cost_usd, cost_source, tokens}`).
+- ✅ **LLM-judge detector slot** (`aegis/policy/llm_judge.py`): opt-in,
+  bounded (input/output char budget, timeout), tenant-overridable model.
+  A positive verdict above threshold becomes a HIGH-severity injection
+  finding; a judge crash is a soft-fail recorded in the envelope.
+- ✅ **Distributed budget + loop store** (`aegis/safety/redis_backend.py`):
+  set `AEGIS_REDIS_URL` to share state across replicas; falls back to the
+  in-memory implementation automatically.
+- ✅ **Streaming SSE responses** (`aegis/policy/streaming.py`): the gateway
+  forwards SSE end-to-end with an incremental output redactor whose sliding
+  buffer catches secrets that straddle chunk boundaries. Reconciled cost,
+  audit, agent risk update, and budget commit all happen on stream-end.
+
+## Still on the explicit roadmap
+
 - **ML-based detectors** plugged in alongside the regex detectors:
   - [Microsoft Presidio](https://github.com/microsoft/presidio) for
     multilingual PII.
-  - LLM-judge classifier for prompt-injection signals that regex can't catch
-    (paraphrased "ignore" instructions, multi-language jailbreaks).
   - In-house classifier for industry-specific PHI / IP terms.
-- **Distributed budget + loop store**: swap the in-memory enforcer for Redis
-  so multi-replica deployments share counters in real time.
-- **Cost reconciliation**: post-process upstream `usage` fields to replace
-  estimates with billing-grade actuals before they hit budgets.
+  (The LLM-judge slot is the bridge until these land.)
+- **Streaming for Anthropic `/v1/messages`** — today we stream OpenAI-shaped
+  SSE; Anthropic's `event:` / nested-block format needs its own adapter.
 - **SSO**: SAML + OIDC for the admin console, SCIM for user provisioning.
 - **Postgres migrations** via Alembic.
 - **KMS-wrapped envelope encryption** for the tool-credential vault and
