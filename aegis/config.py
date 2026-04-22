@@ -59,6 +59,8 @@ class Settings(BaseSettings):
         default=True, alias="AEGIS_DEFAULT_BLOCK_ON_HIGH_SEVERITY"
     )
 
+    redis_url: str | None = Field(default=None, alias="AEGIS_REDIS_URL")
+
     @property
     def allowed_hosts_list(self) -> list[str]:
         return [h.strip() for h in self.allowed_hosts.split(",") if h.strip()]

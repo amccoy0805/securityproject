@@ -56,6 +56,7 @@ from ..policy.rules import (
 )
 from ..pricing import cost_from_usage, estimate_cost_usd, normalise_usage
 from ..providers import ProviderError, get_provider
+from ..safety import get_runtime
 from ..safety.agents import (
     AgentObservation,
     derive_agent_name,
@@ -68,8 +69,6 @@ from ..safety.approvals import (
     create_ticket,
 )
 from ..safety.budgets import BudgetSpec
-from ..safety.budgets import enforcer as budget_enforcer
-from ..safety.loops import detector as loop_detector
 from ..safety.network import client_ip
 from ..safety.tools import (
     ToolPolicy,
@@ -271,6 +270,7 @@ async def _proxy(
         agent_autonomy = agent.autonomy
 
     # ---- Loop / runaway detection (before policy + before upstream) ----
+    budget_enforcer, loop_detector = get_runtime()
     loop = loop_detector.observe(
         tenant_id=ctx.tenant.id, api_key_id=api_key_id, model=model, text=plain
     )
@@ -814,13 +814,14 @@ async def anthropic_messages(request: Request, ctx: AuthContext = Depends(requir
 async def my_policy(ctx: AuthContext = Depends(require_api_key)) -> dict[str, Any]:
     spec = await _resolve_spec(ctx)
     api_key_id = ctx.api_key.id if ctx.api_key else None
+    enforcer, _ = get_runtime()
     return {
         "tenant": ctx.tenant.name,
         "actor": ctx.actor_label,
         "policy": spec.to_dict(),
         "anomaly_window": tracker.stats(ctx.tenant.id),
-        "usage_last_hour": budget_enforcer.stats(ctx.tenant.id, api_key_id, window_seconds=3600),
-        "usage_last_day": budget_enforcer.stats(ctx.tenant.id, api_key_id, window_seconds=86_400),
+        "usage_last_hour": enforcer.stats(ctx.tenant.id, api_key_id, window_seconds=3600),
+        "usage_last_day": enforcer.stats(ctx.tenant.id, api_key_id, window_seconds=86_400),
     }
 
 
