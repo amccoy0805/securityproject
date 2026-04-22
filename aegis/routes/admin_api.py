@@ -487,6 +487,7 @@ async def upsert_tool(
             tool.enabled = body.enabled
             tool.requires_approval = body.requires_approval
             tool.schema_hash = computed_hash
+            tool.schema_json = body.tool_schema
             tool.config = body.config
         else:
             tool = RegisteredTool(
@@ -497,6 +498,7 @@ async def upsert_tool(
                 enabled=body.enabled,
                 requires_approval=body.requires_approval,
                 schema_hash=computed_hash,
+                schema_json=body.tool_schema,
                 config=body.config,
             )
             session.add(tool)

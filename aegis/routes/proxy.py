@@ -47,7 +47,7 @@ from ..policy.rules import (
     fold,
     parse_rules,
 )
-from ..pricing import estimate_cost_usd
+from ..pricing import cost_from_usage, estimate_cost_usd, normalise_usage
 from ..providers import ProviderError, get_provider
 from ..safety.agents import (
     AgentObservation,
@@ -580,9 +580,13 @@ async def _proxy(
     response_body.setdefault("aegis", {})
     actual_input_chars = len(plain or "")
     actual_output_chars = len(output_text or "")
-    actual_cost = estimate_cost_usd(
+    upstream_usage = response_body.get("usage") if isinstance(response_body, dict) else None
+    reconciled_cost = cost_from_usage(model, upstream_usage, overrides=spec.model_prices)
+    estimated_cost = estimate_cost_usd(
         model, actual_input_chars, actual_output_chars, overrides=spec.model_prices
     )
+    actual_cost = reconciled_cost if reconciled_cost is not None else estimated_cost
+    cost_source = "reconciled" if reconciled_cost is not None else "estimated"
     response_body["aegis"] = {
         "request_id": request_id,
         "decision": final_decision,
@@ -594,7 +598,10 @@ async def _proxy(
         "usage": {
             "input_chars": actual_input_chars,
             "output_chars": actual_output_chars,
-            "estimated_cost_usd": round(actual_cost, 6),
+            "estimated_cost_usd": round(estimated_cost, 6),
+            "reconciled_cost_usd": (round(reconciled_cost, 6) if reconciled_cost is not None else None),
+            "cost_source": cost_source,
+            "tokens": normalise_usage(upstream_usage),
         },
         "overrides": {
             "budget": override_budget,
@@ -654,6 +661,8 @@ async def _proxy(
                 "matched_categories": decision.matched_categories,
                 "untrusted_present": decision.untrusted_present,
                 "estimated_cost_usd": round(actual_cost, 6),
+                "cost_source": cost_source,
+                "tokens": normalise_usage(upstream_usage),
                 "rules": [r.to_dict() for r in rule_results],
                 "issued_tickets": issued_tickets,
                 "overrides": {

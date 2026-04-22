@@ -376,6 +376,112 @@ def test_proxy_strips_destructive_outbound_tool_call(client, monkeypatch):
     assert data2["aegis"]["overrides"]["action"] is True
 
 
+def test_proxy_blocks_call_with_schema_violating_args(client, monkeypatch):
+    """Model emits a tool call whose args don't conform to the registered schema."""
+    _set_creds(client)
+    key = _create_key(client)
+    _login(client)
+
+    # Register a strict schema.
+    schema = {
+        "type": "function",
+        "function": {
+            "name": "place_order",
+            "parameters": {
+                "type": "object",
+                "required": ["sku", "qty"],
+                "properties": {
+                    "sku": {"type": "string", "minLength": 4},
+                    "qty": {"type": "integer", "minimum": 1, "maximum": 100},
+                },
+                "additionalProperties": False,
+            },
+        },
+    }
+    r = client.post(
+        "/admin/api/tools",
+        json={
+            "name": "place_order",
+            "action_class": "financial",
+            "enabled": True,
+            "schema": schema,
+        },
+    )
+    assert r.status_code == 201, r.text
+
+    import httpx as _httpx
+
+    class _T(_httpx.AsyncBaseTransport):
+        async def handle_async_request(self, req):
+            body = {
+                "id": "x", "object": "chat.completion", "model": "gpt-4o-mini",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "c", "type": "function",
+                            "function": {
+                                "name": "place_order",
+                                # Missing required `sku`, qty wrong type, extra junk.
+                                "arguments": '{"qty":"five","extra":"junk"}',
+                            },
+                        }],
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+            }
+            return _httpx.Response(200, json=body)
+
+    real = _httpx.AsyncClient.__init__
+
+    def patched(self, *a, **kw):
+        kw["transport"] = _T()
+        real(self, *a, **kw)
+    monkeypatch.setattr(_httpx.AsyncClient, "__init__", patched)
+
+    body = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "buy stuff"}],
+        "tools": [schema],
+    }
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "X-Aegis-Override-Loop": "1",
+        "X-Aegis-Override-Budget": "1",
+        "X-Aegis-Approve-Action": "1",  # action approval alone shouldn't bypass schema check
+    }
+    r = client.post("/v1/chat/completions", json=body, headers=headers)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    blocked = data["aegis"]["tool_governance"]["blocked_calls"]
+    assert blocked, "schema-invalid call should have been stripped"
+    assert any("schema validation failed" in (b["reason"] or "").lower() for b in blocked)
+    # Tool call must not be relayed to the agent.
+    assert not data["choices"][0]["message"].get("tool_calls")
+
+
+def test_proxy_reports_reconciled_cost_when_upstream_returns_usage(client, mock_transport):
+    _set_creds(client)
+    key = _create_key(client)
+    body = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hi"}]}
+    r = client.post(
+        "/v1/chat/completions",
+        json=body,
+        headers={
+            "Authorization": f"Bearer {key}",
+            "X-Aegis-Override-Loop": "1",
+            "X-Aegis-Override-Budget": "1",
+        },
+    )
+    assert r.status_code == 200, r.text
+    usage = r.json()["aegis"]["usage"]
+    assert usage["cost_source"] == "reconciled"
+    assert usage["reconciled_cost_usd"] is not None
+    assert usage["tokens"] == {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+
+
 def test_proxy_auto_discovers_agent_and_returns_envelope(client, mock_transport):
     _set_creds(client)
     key = _create_key(client)

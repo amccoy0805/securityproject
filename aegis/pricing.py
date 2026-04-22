@@ -1,18 +1,36 @@
 """Token / cost estimation for upstream models.
 
-This is a *defensive* estimator: it is not a substitute for the upstream
-provider's billing. It exists to drive in-flight budget enforcement and
-admin dashboards. Numbers are USD per 1M tokens, prompt+completion blended
-where the upstream charges asymmetrically — admins can override per tenant
-via policy spec key ``model_prices``.
+Two pricing layers, in this order:
 
-You can update this table without touching anything else; the budget
-enforcer reads it through ``estimate_request_cost``.
+1. **Reconciled** (preferred) — when the upstream returns a ``usage`` block
+   with ``prompt_tokens`` / ``completion_tokens`` (OpenAI) or
+   ``input_tokens`` / ``output_tokens`` (Anthropic), Aegis uses those
+   billing-grade actuals to commit cost to the budget enforcer.
+2. **Estimated** — used pre-flight (before the upstream call) to predict
+   whether a request would push a budget over the line. Today this is a
+   chars/token approximation; for OpenAI-compatible models we also expose a
+   ``tiktoken`` path when the optional dep is installed.
+
+Both paths share the same per-model price table so the numbers stay
+comparable; ``cost_from_usage`` and ``estimate_cost_usd`` both return USD.
+
+Admins can override prices per tenant via the ``model_prices`` policy
+spec key.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any
+
+log = logging.getLogger("aegis.pricing")
+
+try:
+    import tiktoken  # type: ignore[import-not-found]
+    _TIKTOKEN_OK = True
+except Exception:  # pragma: no cover
+    _TIKTOKEN_OK = False
+    tiktoken = None
 
 # USD per 1M characters (we estimate ~4 chars/token, conservatively rounded).
 # Defaults are intentionally a bit pessimistic so budgets bite earlier rather
@@ -57,5 +75,64 @@ def estimate_cost_usd(
     *,
     overrides: dict[str, Any] | None = None,
 ) -> float:
+    """Pre-flight estimate based on character counts."""
     p = lookup_price(model, overrides)
     return (input_chars / 1_000_000.0) * p["input"] + (output_chars / 1_000_000.0) * p["output"]
+
+
+# A chars-per-token ratio chosen to *match* the per-character price table
+# above (those numbers were calibrated against ~4 chars/token). When we have
+# real token counts from the upstream, we convert tokens → equivalent
+# characters and reuse the same table so reconciled and estimated values are
+# directly comparable.
+_CHARS_PER_TOKEN = 4
+
+
+def cost_from_usage(
+    model: str | None,
+    usage: dict[str, Any] | None,
+    *,
+    overrides: dict[str, Any] | None = None,
+) -> float | None:
+    """Reconciled cost from an upstream ``usage`` block; ``None`` if absent."""
+    if not isinstance(usage, dict):
+        return None
+    in_tok = usage.get("prompt_tokens") or usage.get("input_tokens")
+    out_tok = usage.get("completion_tokens") or usage.get("output_tokens")
+    if in_tok is None and out_tok is None:
+        return None
+    in_chars = int(in_tok or 0) * _CHARS_PER_TOKEN
+    out_chars = int(out_tok or 0) * _CHARS_PER_TOKEN
+    return estimate_cost_usd(model, in_chars, out_chars, overrides=overrides)
+
+
+def normalise_usage(usage: dict[str, Any] | None) -> dict[str, int] | None:
+    """Return ``{prompt_tokens, completion_tokens, total_tokens}`` from any
+    OpenAI- or Anthropic-shaped ``usage`` dict; ``None`` if the dict has no
+    recognisable token fields."""
+    if not isinstance(usage, dict):
+        return None
+    pt = usage.get("prompt_tokens", usage.get("input_tokens"))
+    ct = usage.get("completion_tokens", usage.get("output_tokens"))
+    if pt is None and ct is None:
+        return None
+    pt = int(pt or 0)
+    ct = int(ct or 0)
+    return {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
+
+
+def count_tokens(text: str, *, model: str | None = None) -> int | None:
+    """Best-effort token count using tiktoken when available; ``None`` otherwise."""
+    if not text or not _TIKTOKEN_OK:
+        return None
+    try:
+        if model:
+            try:
+                enc = tiktoken.encoding_for_model(model)
+            except KeyError:
+                enc = tiktoken.get_encoding("cl100k_base")
+        else:
+            enc = tiktoken.get_encoding("cl100k_base")
+        return len(enc.encode(text))
+    except Exception:  # pragma: no cover  (tiktoken corner cases)
+        return None

@@ -162,6 +162,10 @@ class RegisteredTool(Base):
     # read | write | destructive | financial | network
     action_class: Mapped[str] = mapped_column(String(40), default="read")
     schema_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Full registered tool schema (OpenAI's `{type:function,function:{...}}` or
+    # Anthropic's `{name, input_schema}` shape). When present, every model-emitted
+    # call is validated against the `parameters` (or `input_schema`) slice.
+    schema_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     requires_approval: Mapped[bool] = mapped_column(Boolean, default=False)
     # JSON: domain allow/deny lists, monetary cap, custom guardrails

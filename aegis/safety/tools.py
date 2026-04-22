@@ -29,6 +29,7 @@ from typing import Any
 
 from ..models import RegisteredTool
 from .actions import classify_tool
+from .schema_validate import validate_arguments
 from .url_safety import UrlFinding, extract_urls, inspect_url
 
 
@@ -329,6 +330,21 @@ def _evaluate_call(
     declared = reg.action_class if reg else None
     verdict = classify_tool(name, declared=declared)
     action_class = verdict.cls.value
+
+    # Schema validation against the registered JSON Schema.
+    if reg and getattr(reg, "schema_json", None):
+        sv = validate_arguments(args, tool_schema=reg.schema_json)
+        if not sv.ok:
+            joined = "; ".join(sv.errors[:3])
+            return ToolFinding(
+                name=name,
+                severity="high",
+                reason=(
+                    f"tool argument schema validation failed: {joined}; blocked"
+                ),
+                action_class=action_class,
+                arguments_excerpt=_excerpt_args(args),
+            )
 
     cfg = (reg.config if reg else {}) or {}
     allow_domains = list(cfg.get("allow_domains", [])) if isinstance(cfg, dict) else []
