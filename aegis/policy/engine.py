@@ -12,6 +12,7 @@ from enum import Enum
 from typing import Any
 
 from .detectors import Finding, Severity, redact_text, scan_text
+from .injection import scan_injection
 from .profiles import build_default_spec
 
 
@@ -33,6 +34,11 @@ class PolicySpec:
     store_request_excerpts: bool = True
     max_request_chars: int = 200_000
     redact_response: bool = True
+    scan_injection: bool = True
+    budgets: dict[str, Any] | None = None
+    loop_threshold: int = 8
+    loop_window_seconds: int = 120
+    model_prices: dict[str, dict[str, float]] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PolicySpec:
@@ -47,6 +53,11 @@ class PolicySpec:
             store_request_excerpts=bool(data.get("store_request_excerpts", True)),
             max_request_chars=int(data.get("max_request_chars", 200_000)),
             redact_response=bool(data.get("redact_response", True)),
+            scan_injection=bool(data.get("scan_injection", True)),
+            budgets=data.get("budgets"),
+            loop_threshold=int(data.get("loop_threshold", 8)),
+            loop_window_seconds=int(data.get("loop_window_seconds", 120)),
+            model_prices=dict(data.get("model_prices", {})),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -59,6 +70,11 @@ class PolicySpec:
             "store_request_excerpts": self.store_request_excerpts,
             "max_request_chars": self.max_request_chars,
             "redact_response": self.redact_response,
+            "scan_injection": self.scan_injection,
+            "budgets": self.budgets,
+            "loop_threshold": self.loop_threshold,
+            "loop_window_seconds": self.loop_window_seconds,
+            "model_prices": dict(self.model_prices),
         }
 
 
@@ -72,6 +88,7 @@ class PolicyInput:
     model: str | None = None
     provider: str | None = None
     user_label: str | None = None
+    untrusted: bool = False  # whole-request marker (e.g. X-Aegis-Untrusted)
 
 
 @dataclass
@@ -82,6 +99,7 @@ class PolicyDecision:
     sanitized_text: str
     reason: str
     matched_categories: list[str]
+    untrusted_present: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -90,6 +108,7 @@ class PolicyDecision:
             "findings": [f.to_dict() for f in self.findings],
             "matched_categories": list(self.matched_categories),
             "reason": self.reason,
+            "untrusted_present": self.untrusted_present,
         }
 
 
@@ -126,17 +145,26 @@ def evaluate_inbound(spec: PolicySpec, request: PolicyInput) -> PolicyDecision:
                 f"of {spec.max_request_chars} characters."
             ),
             matched_categories=[],
+            untrusted_present=request.untrusted,
         )
 
-    findings = scan_text(request.text, enabled_categories=spec.categories or None)
+    inj = scan_injection(
+        request.text, untrusted_request=request.untrusted, enabled=spec.scan_injection
+    )
+    working_text = inj.sanitized_text  # invisibles removed, untrusted tags stripped
+    data_findings = scan_text(working_text, enabled_categories=spec.categories or None)
+    findings: list[Finding] = list(data_findings) + list(inj.findings)
+    untrusted_present = inj.untrusted_present
+
     if not findings:
         return PolicyDecision(
             decision=Decision.ALLOW,
             severity=None,
             findings=[],
-            sanitized_text=request.text,
-            reason="No sensitive content detected.",
+            sanitized_text=working_text,
+            reason="No sensitive content or injection signals detected.",
             matched_categories=[],
+            untrusted_present=untrusted_present,
         )
 
     top_severity = max((f.severity for f in findings), key=lambda s: s.rank)
@@ -148,43 +176,54 @@ def evaluate_inbound(spec: PolicySpec, request: PolicyInput) -> PolicyDecision:
             decision=Decision.BLOCK,
             severity=top_severity,
             findings=findings,
-            sanitized_text=request.text,
+            sanitized_text=working_text,
             reason=(
                 f"Blocked: {len(findings)} finding(s) including {top_severity.value} "
                 f"severity ({', '.join(matched_categories)})."
             ),
             matched_categories=matched_categories,
+            untrusted_present=untrusted_present,
         )
     if action == "redact":
         return PolicyDecision(
             decision=Decision.REDACT,
             severity=top_severity,
             findings=findings,
-            sanitized_text=redact_text(request.text, findings),
+            sanitized_text=redact_text(working_text, findings),
             reason=(
                 f"Redacted {len(findings)} finding(s) "
                 f"({', '.join(matched_categories)}) before forwarding."
             ),
             matched_categories=matched_categories,
+            untrusted_present=untrusted_present,
         )
     return PolicyDecision(
         decision=Decision.ALLOW,
         severity=top_severity,
         findings=findings,
-        sanitized_text=request.text,
-        reason="Sensitive content detected but policy permits at this severity.",
+        sanitized_text=working_text,
+        reason="Findings present but policy permits at this severity.",
         matched_categories=matched_categories,
+        untrusted_present=untrusted_present,
     )
 
 
 def apply_outbound(spec: PolicySpec, text: str) -> tuple[str, list[Finding]]:
-    """Re-scan model output and redact before returning to the client."""
+    """Re-scan model output and redact before returning to the client.
+
+    On the response side we also run the injection scan: model output that
+    contains a markdown-image data-exfil link, hidden Unicode tags, or a forged
+    system block is *itself* an attack surface (renderers will execute it).
+    """
     if not spec.redact_response or not text:
         return text, []
-    findings = scan_text(text, enabled_categories=spec.categories or None)
+    inj = scan_injection(text, untrusted_request=False, enabled=spec.scan_injection)
+    working = inj.sanitized_text
+    data_findings = scan_text(working, enabled_categories=spec.categories or None)
+    findings = list(data_findings) + list(inj.findings)
     if not findings:
-        return text, []
-    return redact_text(text, findings), findings
+        return working, []
+    return redact_text(working, findings), findings
 
 
 def effective_spec(profile_names: list[str], overrides: dict[str, Any] | None = None) -> PolicySpec:

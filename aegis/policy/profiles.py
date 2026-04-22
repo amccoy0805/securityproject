@@ -17,48 +17,66 @@ from typing import Any
 COMPLIANCE_PROFILES: dict[str, dict[str, Any]] = {
     "baseline": {
         "description": "Sensible defaults for general enterprise use.",
-        "categories": ["pii", "secret", "pci", "phi", "financial", "network"],
+        "categories": [
+            "pii", "secret", "pci", "phi", "financial", "network",
+            "injection", "exfiltration",
+        ],
         "actions": {"low": "allow", "medium": "redact", "high": "block"},
         "model_allow": [],   # empty = allow all configured providers
         "model_deny": [],
         "store_request_excerpts": True,
         "max_request_chars": 200_000,
+        "scan_injection": True,
     },
     "gdpr": {
         "description": "EU GDPR — minimise personal data exposure to AI.",
-        "categories": ["pii", "secret", "financial", "network"],
+        "categories": ["pii", "secret", "financial", "network", "injection", "exfiltration"],
         "actions": {"low": "redact", "medium": "redact", "high": "block"},
         "model_allow": [],
         "model_deny": [],
         "store_request_excerpts": False,
         "max_request_chars": 100_000,
+        "scan_injection": True,
     },
     "hipaa": {
         "description": "US HIPAA — block PHI from leaving controlled inference.",
-        "categories": ["phi", "pii", "secret"],
+        "categories": ["phi", "pii", "secret", "injection", "exfiltration"],
         "actions": {"low": "redact", "medium": "block", "high": "block"},
         "model_allow": [],
         "model_deny": [],
         "store_request_excerpts": False,
         "max_request_chars": 80_000,
+        "scan_injection": True,
     },
     "pci": {
         "description": "PCI-DSS — never let PAN/CVV reach AI providers.",
-        "categories": ["pci", "secret", "pii"],
+        "categories": ["pci", "secret", "pii", "injection", "exfiltration"],
         "actions": {"low": "allow", "medium": "redact", "high": "block"},
         "model_allow": [],
         "model_deny": [],
         "store_request_excerpts": False,
         "max_request_chars": 100_000,
+        "scan_injection": True,
     },
     "secrets-only": {
         "description": "Just block credentials and API keys; useful for dev tools.",
-        "categories": ["secret"],
+        "categories": ["secret", "injection", "exfiltration"],
         "actions": {"low": "allow", "medium": "block", "high": "block"},
         "model_allow": [],
         "model_deny": [],
         "store_request_excerpts": True,
         "max_request_chars": 500_000,
+        "scan_injection": True,
+    },
+    "agent-safety": {
+        "description": "For autonomous agents (OpenCLaw / OpenDevin / etc.) — strict on injection, exfiltration, and untrusted scraped content.",
+        "categories": ["secret", "injection", "exfiltration", "pii"],
+        "actions": {"low": "redact", "medium": "block", "high": "block"},
+        "model_allow": [],
+        "model_deny": [],
+        "store_request_excerpts": True,
+        "max_request_chars": 300_000,
+        "scan_injection": True,
     },
 }
 
@@ -90,6 +108,7 @@ def build_default_spec(profile_names: list[str]) -> dict[str, Any]:
     allow_lists: list[list[str]] = []
     store_excerpts = True
     max_chars = 10**9
+    scan_injection = False
 
     for p in profiles:
         categories.update(p["categories"])
@@ -100,6 +119,7 @@ def build_default_spec(profile_names: list[str]) -> dict[str, Any]:
             allow_lists.append(list(p["model_allow"]))
         store_excerpts = store_excerpts and p["store_request_excerpts"]
         max_chars = min(max_chars, p["max_request_chars"])
+        scan_injection = scan_injection or bool(p.get("scan_injection", True))
 
     if allow_lists:
         allow_set = set(allow_lists[0])
@@ -118,4 +138,8 @@ def build_default_spec(profile_names: list[str]) -> dict[str, Any]:
         "store_request_excerpts": store_excerpts,
         "max_request_chars": max_chars,
         "redact_response": True,
+        "scan_injection": scan_injection,
+        "budgets": None,
+        "loop_threshold": 8,
+        "loop_window_seconds": 120,
     }
