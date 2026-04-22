@@ -28,6 +28,7 @@ from sqlalchemy import select
 
 from ..audit import record_event, tracker
 from ..auth import AuthContext, require_api_key
+from ..config import get_settings
 from ..db import session_scope
 from ..models import Agent, Policy, ProtectedDomain, ProviderCredential, RegisteredTool
 from ..policy import (
@@ -39,6 +40,12 @@ from ..policy import (
     evaluate_inbound,
 )
 from ..policy.engine import effective_spec
+from ..policy.llm_judge import (
+    JudgeConfig,
+    LLMJudge,
+    OpenAIJudge,
+    verdict_to_finding,
+)
 from ..policy.rules import (
     CONSUMER_DEFAULT_RULES,
     RuleContext,
@@ -116,6 +123,26 @@ async def _resolve_registered_tools(tenant_id: str) -> dict[str, RegisteredTool]
             select(RegisteredTool).where(RegisteredTool.tenant_id == tenant_id)
         )
         return {t.name: t for t in rows.scalars()}
+
+
+_JUDGE_FACTORY: list[Any] = [None]  # process-global hook used by tests
+
+
+def set_judge_factory(factory):
+    """Register a custom ``(spec) -> LLMJudge`` factory (used by tests + customers)."""
+    _JUDGE_FACTORY[0] = factory
+
+
+def _build_judge(spec: PolicySpec) -> tuple[LLMJudge, JudgeConfig] | None:
+    cfg = JudgeConfig.from_dict(spec.llm_judge)
+    if not cfg.enabled:
+        return None
+    factory = _JUDGE_FACTORY[0]
+    if factory is not None:
+        judge = factory(spec)
+        return (judge, cfg) if judge is not None else None
+    settings = get_settings()
+    return OpenAIJudge(api_key=settings.openai_api_key, base_url=settings.openai_base_url), cfg
 
 
 async def _resolve_protected_domains(tenant_id: str) -> list[str]:
@@ -343,6 +370,33 @@ async def _proxy(
             untrusted=untrusted,
         ),
     )
+
+    # ---- Optional LLM judge (off by default) ----
+    judge_verdict_dict: dict[str, Any] | None = None
+    judge_pair = _build_judge(spec)
+    if judge_pair is not None:
+        judge, jcfg = judge_pair
+        should_run = (not jcfg.only_when_untrusted) or decision.untrusted_present or untrusted
+        if should_run and plain:
+            try:
+                jv = await judge.judge(plain, cfg=jcfg)
+            except Exception as exc:  # defensive: judge bugs must not block the request
+                jv = None
+                judge_verdict_dict = {"error": f"{exc}", "skipped": True}
+            if jv is not None:
+                judge_verdict_dict = jv.to_dict()
+                f = verdict_to_finding(jv, cfg=jcfg, span_end=len(plain))
+                if f is not None:
+                    # Inject as an injection finding; promote decision to BLOCK because
+                    # the judge already weighs severity against threshold.
+                    decision.findings.append(f)
+                    if "injection" not in decision.matched_categories:
+                        decision.matched_categories = sorted(set(decision.matched_categories) | {"injection"})
+                    decision.severity = decision.findings and max(
+                        (ff.severity for ff in decision.findings), key=lambda s: s.rank
+                    )
+                    decision.decision = Decision.BLOCK
+                    decision.reason = f"LLM judge flagged injection (score {jv.score:.2f}): {jv.reason}"
 
     # ---- Human-readable rules engine ----
     rules = parse_rules(spec.rules)
@@ -595,6 +649,7 @@ async def _proxy(
         "untrusted_present": decision.untrusted_present,
         "policy_profiles": spec.profiles,
         "rules": [r.to_dict() for r in rule_results],
+        "llm_judge": judge_verdict_dict,
         "usage": {
             "input_chars": actual_input_chars,
             "output_chars": actual_output_chars,

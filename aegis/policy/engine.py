@@ -41,6 +41,7 @@ class PolicySpec:
     model_prices: dict[str, dict[str, float]] = field(default_factory=dict)
     tool_governance: dict[str, Any] | None = None
     rules: list[dict[str, Any]] = field(default_factory=list)
+    llm_judge: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PolicySpec:
@@ -62,6 +63,7 @@ class PolicySpec:
             model_prices=dict(data.get("model_prices", {})),
             tool_governance=data.get("tool_governance"),
             rules=list(data.get("rules", [])),
+            llm_judge=data.get("llm_judge"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -81,6 +83,7 @@ class PolicySpec:
             "model_prices": dict(self.model_prices),
             "tool_governance": self.tool_governance,
             "rules": list(self.rules),
+            "llm_judge": self.llm_judge,
         }
 
 
