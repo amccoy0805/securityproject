@@ -36,11 +36,14 @@ from .url_safety import UrlFinding, extract_urls, inspect_url
 class ToolPolicy:
     enforce_registry: bool = True
     require_approval_for: list[str] = field(
-        default_factory=lambda: ["destructive", "financial"]
+        default_factory=lambda: ["destructive", "financial", "memory_write"]
     )
     monetary_threshold_usd: float = 100.0
     deny_domains: list[str] = field(default_factory=list)
     schema_mismatch_blocks: bool = True
+    sandbox_required_for: list[str] = field(default_factory=list)
+    require_sandbox_class: list[str] = field(default_factory=list)
+    protected_domains: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> ToolPolicy:
@@ -57,6 +60,12 @@ class ToolPolicy:
             spec.deny_domains = [str(x).lower() for x in data["deny_domains"]]
         if "schema_mismatch_blocks" in data:
             spec.schema_mismatch_blocks = bool(data["schema_mismatch_blocks"])
+        if "sandbox_required_for" in data and isinstance(data["sandbox_required_for"], list):
+            spec.sandbox_required_for = [str(x) for x in data["sandbox_required_for"]]
+        if "require_sandbox_class" in data and isinstance(data["require_sandbox_class"], list):
+            spec.require_sandbox_class = [str(x).lower() for x in data["require_sandbox_class"]]
+        if "protected_domains" in data and isinstance(data["protected_domains"], list):
+            spec.protected_domains = [str(x).lower() for x in data["protected_domains"]]
         return spec
 
 
@@ -325,6 +334,13 @@ def _evaluate_call(
     allow_domains = list(cfg.get("allow_domains", [])) if isinstance(cfg, dict) else []
     deny_domains = list(policy.deny_domains) + list(cfg.get("deny_domains", [])) if isinstance(cfg, dict) else list(policy.deny_domains)
     allow_private = bool(cfg.get("allow_private_targets", False)) if isinstance(cfg, dict) else False
+    protected = list(policy.protected_domains)
+    if isinstance(cfg, dict):
+        protected.extend(cfg.get("protected_domains", []) or [])
+
+    sandbox_required = bool(cfg.get("sandbox_required", False)) if isinstance(cfg, dict) else False
+    if action_class in policy.require_sandbox_class or (reg and reg.name in policy.sandbox_required_for):
+        sandbox_required = True
 
     url_findings: list[UrlFinding] = []
     for url in extract_urls(args):
@@ -333,6 +349,7 @@ def _evaluate_call(
             allow_domains=allow_domains or None,
             deny_domains=deny_domains or None,
             allow_private=allow_private,
+            protected_domains=protected or None,
         )
         url_findings.extend(v.findings)
         if not v.allowed:
@@ -342,6 +359,21 @@ def _evaluate_call(
                 action_class=action_class,
                 arguments_excerpt=_excerpt_args(args),
                 url_findings=v.findings,
+            )
+
+    if sandbox_required:
+        sandbox_token = (str(args.get("_sandbox", "")).lower() if isinstance(args, dict) else "")
+        if sandbox_token not in {"1", "true", "yes"}:
+            return ToolFinding(
+                name=name, severity="high",
+                reason=(
+                    "tool requires sandboxed execution; refusing to relay until "
+                    "the orchestrator marks the call with `_sandbox: true` "
+                    "(see docs/agent-safety.md §7)."
+                ),
+                action_class=action_class,
+                arguments_excerpt=_excerpt_args(args),
+                url_findings=url_findings,
             )
 
     needs_approval = (

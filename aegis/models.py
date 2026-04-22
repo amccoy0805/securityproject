@@ -57,6 +57,12 @@ class Tenant(Base):
     tools: Mapped[list[RegisteredTool]] = relationship(
         back_populates="tenant", cascade="all, delete-orphan"
     )
+    agents: Mapped[list[Agent]] = relationship(
+        back_populates="tenant", cascade="all, delete-orphan"
+    )
+    protected_domains: Mapped[list[ProtectedDomain]] = relationship(
+        back_populates="tenant", cascade="all, delete-orphan"
+    )
 
 
 class User(Base):
@@ -190,3 +196,125 @@ class AuditEvent(Base):
     response_excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
     extra: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+    # Tamper-evident audit chain: each row records the previous row's hash and
+    # its own hash over the canonical payload. ``audit_hash`` in :mod:`aegis.audit`
+    # verifies the chain on demand.
+    prev_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    this_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    agent_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+
+
+class Agent(Base):
+    """A logical agent — a deployed bot, integration, or workflow.
+
+    Agents are auto-discovered the first time the proxy sees a new
+    ``X-Aegis-Agent`` header or new (api_key, model) combination, so
+    customers get an inventory immediately without manual setup. Admins can
+    rename them, set allowed model lists, declare autonomy level, and tighten
+    risk-relevant settings.
+    """
+
+    __tablename__ = "agents"
+    __table_args__ = (UniqueConstraint("tenant_id", "name", name="uq_agent_per_tenant"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"))
+    name: Mapped[str] = mapped_column(String(200))
+    kind: Mapped[str] = mapped_column(String(50), default="assistant")  # assistant|workflow|browser|background
+    autonomy: Mapped[str] = mapped_column(String(20), default="supervised")  # supervised|semi|autonomous
+    description: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    discovered_from: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    discovered_via_key_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_seen_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_model: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    request_count: Mapped[int] = mapped_column(Integer, default=0)
+    block_count: Mapped[int] = mapped_column(Integer, default=0)
+    risk_score: Mapped[int] = mapped_column(Integer, default=0)
+    risk_factors: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    tenant: Mapped[Tenant] = relationship(back_populates="agents")
+
+
+class PendingApproval(Base):
+    """Async human-in-the-loop ticket for a sensitive action.
+
+    Created when a model emits a sensitive ``tool_call`` (or a custom rule
+    requires approval) without ``X-Aegis-Approve-Action: 1``. The agent
+    receives a ticket id; a human approves/denies it from the admin queue;
+    the agent then re-submits the original request with
+    ``X-Aegis-Approval-Ticket: <id>`` and the gateway lets the call through.
+    """
+
+    __tablename__ = "pending_approvals"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
+    agent_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    api_key_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    actor_label: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    request_id: Mapped[str] = mapped_column(String(36), index=True)
+    action_class: Mapped[str] = mapped_column(String(40))  # destructive|financial|...
+    tool_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    summary: Mapped[str] = mapped_column(Text)
+    arguments_excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    risk_factors: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending|approved|denied|expired
+    decided_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+
+
+class ToolCredential(Base):
+    """Vaulted credential that a registered tool needs (OAuth token, API key, etc.).
+
+    The encrypted blob is stored in ``secret_ciphertext`` — at rest you should
+    wrap this with KMS envelope encryption (``AEGIS_VAULT_KEY``); the model in
+    code is intentionally agnostic to the cipher. ``scopes`` is a CSV of
+    minimum-privilege scopes the tool actually needs; ``expires_at`` drives
+    rotation reminders / soft revoke.
+    """
+
+    __tablename__ = "tool_credentials"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "tool_name", "label", name="uq_toolcred_per_tenant_tool"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"), index=True)
+    tool_name: Mapped[str] = mapped_column(String(120))
+    label: Mapped[str] = mapped_column(String(120), default="default")
+    kind: Mapped[str] = mapped_column(String(40), default="api_key")  # api_key|oauth|basic|custom
+    secret_ciphertext: Mapped[str] = mapped_column(Text)
+    scopes: Mapped[str] = mapped_column(String(500), default="")
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    rotation_period_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    revoked_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+class ProtectedDomain(Base):
+    """Tenant-controlled list of brand domains to detect lookalikes for.
+
+    Used by URL safety to flag punycode/typo lookalikes (``g00gle.com``,
+    ``goog1e.com``, ``аpple.com``) — common in scams and spoofed agents.
+    """
+
+    __tablename__ = "protected_domains"
+    __table_args__ = (UniqueConstraint("tenant_id", "domain", name="uq_protected_domain_per_tenant"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    tenant_id: Mapped[str] = mapped_column(ForeignKey("tenants.id", ondelete="CASCADE"))
+    domain: Mapped[str] = mapped_column(String(255))
+    description: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+    tenant: Mapped[Tenant] = relationship(back_populates="protected_domains")

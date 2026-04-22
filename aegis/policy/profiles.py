@@ -78,6 +78,19 @@ COMPLIANCE_PROFILES: dict[str, dict[str, Any]] = {
         "max_request_chars": 300_000,
         "scan_injection": True,
     },
+    "consumer": {
+        "description": "Safe-by-default for individual consumers: protect privacy, money, and accounts; surface plain-English verdicts.",
+        "categories": [
+            "pii", "secret", "pci", "phi", "financial", "network",
+            "injection", "exfiltration",
+        ],
+        "actions": {"low": "redact", "medium": "redact", "high": "block"},
+        "model_allow": [],
+        "model_deny": [],
+        "store_request_excerpts": False,
+        "max_request_chars": 200_000,
+        "scan_injection": True,
+    },
 }
 
 

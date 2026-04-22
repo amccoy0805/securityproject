@@ -36,6 +36,10 @@ FINANCIAL_KEYWORDS = (
     "withdraw", "wire", "ach", "invoice", "subscribe", "renew", "order",
     "place_order", "stripe", "paypal",
 )
+MEMORY_KEYWORDS = (
+    "memory_write", "remember", "store_memory", "save_memory", "memorize",
+    "note_to_self", "set_memory", "persist_memory", "memory_set",
+)
 WRITE_KEYWORDS = (
     "create", "send", "post", "publish", "schedule", "update", "patch",
     "put", "edit", "modify", "set_", "write_", "append", "rename", "move",
@@ -57,10 +61,16 @@ class ActionClass(str, Enum):
     DESTRUCTIVE = "destructive"
     FINANCIAL = "financial"
     NETWORK = "network"
+    MEMORY_WRITE = "memory_write"
 
     @property
     def is_sensitive(self) -> bool:
-        return self in {ActionClass.DESTRUCTIVE, ActionClass.FINANCIAL, ActionClass.WRITE}
+        return self in {
+            ActionClass.DESTRUCTIVE,
+            ActionClass.FINANCIAL,
+            ActionClass.WRITE,
+            ActionClass.MEMORY_WRITE,
+        }
 
 
 @dataclass
@@ -90,6 +100,9 @@ def classify_tool(name: str, *, declared: str | None = None) -> ActionVerdict:
     for kw in FINANCIAL_KEYWORDS:
         if kw in n:
             return ActionVerdict(ActionClass.FINANCIAL, reason=f"name contains '{kw}'")
+    for kw in MEMORY_KEYWORDS:
+        if kw in n:
+            return ActionVerdict(ActionClass.MEMORY_WRITE, reason=f"name contains '{kw}'")
     for kw in NETWORK_KEYWORDS:
         if kw in n:
             return ActionVerdict(ActionClass.NETWORK, reason=f"name contains '{kw}'")
