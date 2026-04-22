@@ -42,7 +42,10 @@ def build_app(gateway: str, api_key: str, hostname: str) -> FastAPI:
             "Content-Type": "application/json",
             "X-Aegis-Endpoint": hostname,
         }
-        for h in ("openai-organization", "openai-project", "anthropic-version", "anthropic-beta"):
+        for h in (
+            "openai-organization", "openai-project", "anthropic-version", "anthropic-beta",
+            "x-aegis-untrusted", "x-aegis-override-budget", "x-aegis-override-loop",
+        ):
             v = request.headers.get(h)
             if v:
                 headers[h] = v

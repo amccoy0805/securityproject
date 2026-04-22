@@ -36,15 +36,38 @@ This is the only architecture that gives a defensible answer to:
 
 Pure-Python, no I/O. The decisioning core.
 
-- `detectors.py` — pluggable detectors that scan text and emit `Finding`s with
-  spans, severities, categories, and tags. Easy to extend with ML-based
-  detectors (Presidio, internal classifiers) without touching the engine.
-- `profiles.py` — built-in compliance profiles (`gdpr`, `hipaa`, `pci`, …).
-  Profiles compose with **strictest-wins** semantics so combining `gdpr+hipaa`
-  always tightens, never loosens.
+- `detectors.py` — pluggable *data* detectors (PII, PHI, PCI, secrets,
+  credentials) that scan text and emit `Finding`s with spans, severities,
+  categories, and tags.
+- `injection.py` — *attacker-side* detectors for prompt-injection,
+  exfiltration, and stealth payloads (instruction overrides, role hijacks,
+  hidden Unicode, markdown-image exfil, malicious scripts, …) plus the
+  `<aegis:untrusted>` channel that auto-elevates findings inside scraped /
+  retrieved content.
+- `profiles.py` — built-in compliance profiles (`gdpr`, `hipaa`, `pci`,
+  `agent-safety`, …). Profiles compose with **strictest-wins** semantics so
+  combining `gdpr+hipaa` always tightens, never loosens.
 - `engine.py` — `evaluate_inbound` (per-request) and `apply_outbound`
   (per-response) primitives plus `effective_spec()` to merge profiles +
-  tenant overrides into one `PolicySpec`.
+  tenant overrides into one `PolicySpec`. Both directions run *both* the
+  data detectors and the injection scanner.
+
+### `aegis/safety/`
+
+Runtime safety controls that don't fit the per-text policy model.
+
+- `budgets.py` — sliding-window per-key and per-tenant budget enforcer for
+  request count, characters, and **estimated USD**. Pre-flight check rejects
+  the request *before* the upstream call so a runaway loop can't run up the
+  bill. Default budgets are always-on.
+- `loops.py` — per-(tenant, key) digest tracker that flags identical-prompt
+  repetition over a short window. The classic "buggy agent loop" canary.
+
+### `aegis/pricing.py`
+
+Per-model USD pricing table, blended for a calibrated chars-per-token
+estimate. Tenants can override prices in their policy spec
+(`model_prices`).
 
 ### `aegis/providers/`
 

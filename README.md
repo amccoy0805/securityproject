@@ -20,15 +20,20 @@ identity model regardless of upstream provider or downstream tool.
 | Pillar | What Aegis enforces |
 | --- | --- |
 | **Data classification** | Detects PII, PHI, PCI, secrets, credentials, internal tokens in every prompt and every response. |
-| **Policy as code** | Composable compliance profiles (`baseline`, `gdpr`, `hipaa`, `pci`, `secrets-only`) plus tenant-specific overrides — severity-based `allow / redact / block`. |
+| **Indirect prompt-injection defense** | Detects instruction-overrides, role hijacks, hidden Unicode/tag stego, markdown-image data exfiltration, malicious HTML comments and scripts — in both directions. Supports an `<aegis:untrusted>…</aegis:untrusted>` channel that auto-elevates findings inside scraped/retrieved content. |
+| **Runaway-loop detection** | Per-key sliding-window detector blocks an agent that sends the same prompt 8+ times in 2 minutes. Explicit `X-Aegis-Override-Loop` to proceed (logged). |
+| **Cost & rate budgets** | Always-on per-key and per-tenant budgets on requests, characters, and **estimated USD** with sane defaults; tighter per-tenant overrides via policy. Explicit `X-Aegis-Override-Budget` to proceed (logged). |
+| **Policy as code** | Composable compliance profiles (`baseline`, `gdpr`, `hipaa`, `pci`, `secrets-only`, `agent-safety`) plus tenant-specific overrides — severity-based `allow / redact / block`. |
 | **Mediated access** | All AI traffic flows through one proxy. Per-tenant API keys; per-tenant upstream credentials so end users never see raw OpenAI/Anthropic keys. |
-| **Tamper-evident audit** | Append-only event log of who asked what, which model answered, what was redacted, latency, sizes — built for SIEM ingest. |
+| **Tamper-evident audit** | Append-only event log of who asked what, which model answered, what was redacted, latency, sizes, estimated cost — built for SIEM ingest. |
 | **Anomaly signal** | Sliding-window block-rate tracking to surface compromised users or runaway integrations. |
 | **Provider-agnostic** | OpenAI, Anthropic, Azure OpenAI, vLLM, Ollama, internal endpoints — one SDK, one policy. |
 | **Endpoint agent** | Lightweight local proxy for laptops/CI so developer tools (Cursor, OpenCLaw, raw `curl`) hit the gateway by changing only `OPENAI_BASE_URL`. |
 
-See [`docs/architecture.md`](docs/architecture.md) for the design rationale and
-[`docs/compliance.md`](docs/compliance.md) for how Aegis maps to GDPR/HIPAA/PCI.
+See [`docs/architecture.md`](docs/architecture.md) for design rationale,
+[`docs/compliance.md`](docs/compliance.md) for GDPR/HIPAA/PCI mapping, and
+[`docs/agent-safety.md`](docs/agent-safety.md) for the agent-specific controls
+(indirect injection, loops, budgets).
 
 ---
 

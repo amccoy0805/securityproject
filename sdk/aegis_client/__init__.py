@@ -15,5 +15,6 @@ Two ways to use Aegis from your apps:
 """
 
 from .client import AegisClient, AegisError
+from .web import quote_scraped
 
-__all__ = ["AegisClient", "AegisError"]
+__all__ = ["AegisClient", "AegisError", "quote_scraped"]

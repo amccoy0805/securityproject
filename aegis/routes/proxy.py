@@ -39,7 +39,11 @@ from ..policy import (
     evaluate_inbound,
 )
 from ..policy.engine import effective_spec
+from ..pricing import estimate_cost_usd
 from ..providers import ProviderError, get_provider
+from ..safety.budgets import BudgetSpec
+from ..safety.budgets import enforcer as budget_enforcer
+from ..safety.loops import detector as loop_detector
 
 router = APIRouter(tags=["proxy"])
 
@@ -89,6 +93,35 @@ def _block_response(request_id: str, decision: PolicyDecision) -> JSONResponse:
     return JSONResponse(status_code=451, content=payload)
 
 
+def _safety_block_response(
+    request_id: str, *, kind: str, message: str, override_header: str, snapshot: dict[str, Any]
+) -> JSONResponse:
+    """Friendly 429 with explicit override instructions."""
+    payload = {
+        "error": {
+            "type": kind,
+            "message": message,
+            "request_id": request_id,
+            "override": (
+                f"To proceed anyway, retry with header `{override_header}: 1`. The override "
+                f"is recorded in the audit log alongside the original block."
+            ),
+            "snapshot": snapshot,
+        }
+    }
+    return JSONResponse(status_code=429, content=payload)
+
+
+def _untrusted_from_request(request: Request) -> bool:
+    raw = request.headers.get("x-aegis-untrusted", "").strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def _override_from_request(request: Request, name: str) -> bool:
+    raw = request.headers.get(name, "").strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
 async def _proxy(
     *,
     provider_name: str,
@@ -116,10 +149,108 @@ async def _proxy(
     spec = await _resolve_spec(ctx)
     plain = adapter.extract_text(body)
     model = adapter.extract_model(body)
+    untrusted = _untrusted_from_request(request)
+    override_budget = _override_from_request(request, "x-aegis-override-budget")
+    override_loop = _override_from_request(request, "x-aegis-override-loop")
+    api_key_id = ctx.api_key.id if ctx.api_key else "no-key"
+
+    # ---- Loop / runaway detection (before policy + before upstream) ----
+    loop = loop_detector.observe(
+        tenant_id=ctx.tenant.id, api_key_id=api_key_id, model=model, text=plain
+    )
+    if loop.looping and not override_loop:
+        async with session_scope() as session:
+            await record_event(
+                session,
+                tenant_id=ctx.tenant.id,
+                request_id=request_id,
+                actor_kind=ctx.actor_kind,
+                actor_id=ctx.actor_id,
+                actor_label=ctx.actor_label,
+                provider=provider_name,
+                model=model,
+                route=upstream_path,
+                decision="block",
+                severity="medium",
+                findings=[],
+                input_text=plain,
+                output_text="",
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                store_excerpts=spec.store_request_excerpts,
+                extra={
+                    "safety": "loop_detected",
+                    "loop_digest": loop.digest,
+                    "repeat_count": loop.repeat_count,
+                    "reason": loop.reason,
+                },
+            )
+        tracker.record(ctx.tenant.id, "block")
+        return _safety_block_response(
+            request_id,
+            kind="runaway_loop_blocked",
+            message=loop.reason or "Repeated identical request blocked.",
+            override_header="X-Aegis-Override-Loop",
+            snapshot={"repeat_count": loop.repeat_count, "digest": loop.digest},
+        )
+
+    # ---- Budget enforcement (pre-flight estimate) ----
+    budget_spec = BudgetSpec.from_dict(spec.budgets)
+    projected_input_chars = len(plain or "")
+    projected_output_chars = max(2_000, projected_input_chars // 2)
+    projected_cost = estimate_cost_usd(
+        model, projected_input_chars, projected_output_chars, overrides=spec.model_prices
+    )
+    pre = budget_enforcer.precheck(
+        budget_spec,
+        tenant_id=ctx.tenant.id,
+        api_key_id=api_key_id,
+        projected_input_chars=projected_input_chars,
+        projected_cost_usd=projected_cost,
+    )
+    if not pre.allowed and budget_spec.require_explicit_override and not override_budget:
+        async with session_scope() as session:
+            await record_event(
+                session,
+                tenant_id=ctx.tenant.id,
+                request_id=request_id,
+                actor_kind=ctx.actor_kind,
+                actor_id=ctx.actor_id,
+                actor_label=ctx.actor_label,
+                provider=provider_name,
+                model=model,
+                route=upstream_path,
+                decision="block",
+                severity="medium",
+                findings=[],
+                input_text=plain,
+                output_text="",
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                store_excerpts=spec.store_request_excerpts,
+                extra={
+                    "safety": "budget_exceeded",
+                    "reason": pre.reason,
+                    "triggered_window": pre.triggered_window,
+                    "snapshot": pre.snapshot,
+                },
+            )
+        tracker.record(ctx.tenant.id, "block")
+        return _safety_block_response(
+            request_id,
+            kind="budget_exceeded",
+            message=f"Budget exceeded: {pre.reason}",
+            override_header="X-Aegis-Override-Budget",
+            snapshot=pre.snapshot,
+        )
 
     decision = evaluate_inbound(
         spec,
-        PolicyInput(text=plain, model=model, provider=provider_name, user_label=ctx.actor_label),
+        PolicyInput(
+            text=plain,
+            model=model,
+            provider=provider_name,
+            user_label=ctx.actor_label,
+            untrusted=untrusted,
+        ),
     )
 
     if decision.decision == Decision.BLOCK:
@@ -147,7 +278,9 @@ async def _proxy(
         return _block_response(request_id, decision)
 
     forwarded_body = body
-    if decision.decision == Decision.REDACT:
+    # Always rewrite when sanitizer changed text (e.g. invisible-char strip,
+    # untrusted-tag removal) even on ALLOW so we don't relay smuggled bytes.
+    if decision.decision == Decision.REDACT or decision.sanitized_text != plain:
         forwarded_body = adapter.rewrite_text(body, decision.sanitized_text)
 
     forward_headers = {
@@ -195,12 +328,27 @@ async def _proxy(
         final_decision = "redact"
 
     response_body.setdefault("aegis", {})
+    actual_input_chars = len(plain or "")
+    actual_output_chars = len(output_text or "")
+    actual_cost = estimate_cost_usd(
+        model, actual_input_chars, actual_output_chars, overrides=spec.model_prices
+    )
     response_body["aegis"] = {
         "request_id": request_id,
         "decision": final_decision,
         "inbound_findings": [f.to_dict() for f in decision.findings],
         "outbound_findings": [f.to_dict() for f in outbound_findings],
+        "untrusted_present": decision.untrusted_present,
         "policy_profiles": spec.profiles,
+        "usage": {
+            "input_chars": actual_input_chars,
+            "output_chars": actual_output_chars,
+            "estimated_cost_usd": round(actual_cost, 6),
+        },
+        "overrides": {
+            "budget": override_budget,
+            "loop": override_loop,
+        },
     }
 
     async with session_scope() as session:
@@ -225,9 +373,19 @@ async def _proxy(
             extra={
                 "upstream_status": upstream.status_code,
                 "matched_categories": decision.matched_categories,
+                "untrusted_present": decision.untrusted_present,
+                "estimated_cost_usd": round(actual_cost, 6),
+                "overrides": {"budget": override_budget, "loop": override_loop},
             },
         )
     tracker.record(ctx.tenant.id, final_decision)
+    budget_enforcer.commit(
+        tenant_id=ctx.tenant.id,
+        api_key_id=api_key_id,
+        input_chars=actual_input_chars,
+        output_chars=actual_output_chars,
+        cost_usd=actual_cost,
+    )
 
     return JSONResponse(status_code=upstream.status_code, content=response_body)
 
@@ -281,22 +439,36 @@ async def anthropic_messages(request: Request, ctx: AuthContext = Depends(requir
 @router.get("/v1/policy/me")
 async def my_policy(ctx: AuthContext = Depends(require_api_key)) -> dict[str, Any]:
     spec = await _resolve_spec(ctx)
+    api_key_id = ctx.api_key.id if ctx.api_key else None
     return {
         "tenant": ctx.tenant.name,
         "actor": ctx.actor_label,
         "policy": spec.to_dict(),
         "anomaly_window": tracker.stats(ctx.tenant.id),
+        "usage_last_hour": budget_enforcer.stats(ctx.tenant.id, api_key_id, window_seconds=3600),
+        "usage_last_day": budget_enforcer.stats(ctx.tenant.id, api_key_id, window_seconds=86_400),
     }
 
 
 @router.post("/v1/policy/check")
-async def check(payload: dict[str, Any], ctx: AuthContext = Depends(require_api_key)) -> dict[str, Any]:
+async def check(
+    payload: dict[str, Any],
+    request: Request,
+    ctx: AuthContext = Depends(require_api_key),
+) -> dict[str, Any]:
     """Dry-run a piece of text against the tenant's policy. No upstream call."""
     text = str(payload.get("text") or "")
     model = payload.get("model")
+    untrusted = bool(payload.get("untrusted")) or _untrusted_from_request(request)
     spec = await _resolve_spec(ctx)
     decision = evaluate_inbound(
-        spec, PolicyInput(text=text, model=str(model) if model else None, user_label=ctx.actor_label)
+        spec,
+        PolicyInput(
+            text=text,
+            model=str(model) if model else None,
+            user_label=ctx.actor_label,
+            untrusted=untrusted,
+        ),
     )
     sanitized_out, outbound = apply_outbound(spec, text) if payload.get("scan_response") else (text, [])
     return {
