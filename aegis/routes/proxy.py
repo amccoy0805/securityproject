@@ -29,7 +29,7 @@ from sqlalchemy import select
 from ..audit import record_event, tracker
 from ..auth import AuthContext, require_api_key
 from ..db import session_scope
-from ..models import Policy, ProviderCredential
+from ..models import Policy, ProviderCredential, RegisteredTool
 from ..policy import (
     Decision,
     PolicyDecision,
@@ -44,6 +44,11 @@ from ..providers import ProviderError, get_provider
 from ..safety.budgets import BudgetSpec
 from ..safety.budgets import enforcer as budget_enforcer
 from ..safety.loops import detector as loop_detector
+from ..safety.tools import (
+    ToolPolicy,
+    inspect_request_tools,
+    inspect_response_calls,
+)
 
 router = APIRouter(tags=["proxy"])
 
@@ -79,6 +84,14 @@ async def _resolve_credential(tenant_id: str, provider: str) -> ProviderCredenti
             )
         )
         return result.scalar_one_or_none()
+
+
+async def _resolve_registered_tools(tenant_id: str) -> dict[str, RegisteredTool]:
+    async with session_scope() as session:
+        rows = await session.execute(
+            select(RegisteredTool).where(RegisteredTool.tenant_id == tenant_id)
+        )
+        return {t.name: t for t in rows.scalars()}
 
 
 def _block_response(request_id: str, decision: PolicyDecision) -> JSONResponse:
@@ -152,6 +165,7 @@ async def _proxy(
     untrusted = _untrusted_from_request(request)
     override_budget = _override_from_request(request, "x-aegis-override-budget")
     override_loop = _override_from_request(request, "x-aegis-override-loop")
+    approve_action = _override_from_request(request, "x-aegis-approve-action")
     api_key_id = ctx.api_key.id if ctx.api_key else "no-key"
 
     # ---- Loop / runaway detection (before policy + before upstream) ----
@@ -283,6 +297,56 @@ async def _proxy(
     if decision.decision == Decision.REDACT or decision.sanitized_text != plain:
         forwarded_body = adapter.rewrite_text(body, decision.sanitized_text)
 
+    # ---- Tool governance: validate the *advertised* tools list (inbound) ----
+    tool_policy = ToolPolicy.from_dict(spec.tool_governance)
+    registered = await _resolve_registered_tools(ctx.tenant.id)
+    inbound_tool_report = inspect_request_tools(
+        request_tools=forwarded_body.get("tools") if isinstance(forwarded_body, dict) else None,
+        registered=registered,
+        policy=tool_policy,
+    )
+    if inbound_tool_report.blocked:
+        async with session_scope() as session:
+            await record_event(
+                session,
+                tenant_id=ctx.tenant.id,
+                request_id=request_id,
+                actor_kind=ctx.actor_kind,
+                actor_id=ctx.actor_id,
+                actor_label=ctx.actor_label,
+                provider=provider_name,
+                model=model,
+                route=upstream_path,
+                decision="block",
+                severity="high",
+                findings=[t.to_dict() for t in inbound_tool_report.findings],
+                input_text=plain,
+                output_text="",
+                latency_ms=int((time.perf_counter() - started) * 1000),
+                store_excerpts=spec.store_request_excerpts,
+                extra={
+                    "safety": "tool_registry_block",
+                    "reason": inbound_tool_report.reason,
+                },
+            )
+        tracker.record(ctx.tenant.id, "block")
+        return JSONResponse(
+            status_code=451,
+            content={
+                "error": {
+                    "type": "tool_registry_block",
+                    "message": inbound_tool_report.reason,
+                    "request_id": request_id,
+                    "findings": [t.to_dict() for t in inbound_tool_report.findings],
+                }
+            },
+        )
+    # If some tools were stripped but at least one survived, send the sanitized list.
+    if isinstance(forwarded_body, dict) and inbound_tool_report.sanitized_tools and \
+            len(inbound_tool_report.sanitized_tools) != len(forwarded_body.get("tools") or []):
+        forwarded_body = dict(forwarded_body)
+        forwarded_body["tools"] = inbound_tool_report.sanitized_tools
+
     forward_headers = {
         k: v
         for k, v in request.headers.items()
@@ -317,11 +381,22 @@ async def _proxy(
 
     output_text = adapter.extract_output_text(upstream.body)
     response_body = upstream.body
+
+    # ---- Tool governance: inspect model-emitted tool calls (outbound) ----
+    outbound_tool_report = None
+    if upstream.status_code < 400 and isinstance(response_body, dict):
+        response_body, outbound_tool_report = inspect_response_calls(
+            response_body,
+            registered=registered,
+            policy=tool_policy,
+            approved=approve_action,
+        )
+
     outbound_findings: list = []
     if upstream.status_code < 400 and output_text:
         sanitized_out, outbound_findings = apply_outbound(spec, output_text)
         if outbound_findings:
-            response_body = adapter.rewrite_output_text(upstream.body, sanitized_out)
+            response_body = adapter.rewrite_output_text(response_body, sanitized_out)
 
     final_decision = decision.decision.value
     if outbound_findings and final_decision == "allow":
@@ -348,7 +423,16 @@ async def _proxy(
         "overrides": {
             "budget": override_budget,
             "loop": override_loop,
+            "action": approve_action,
+            "ip": _override_from_request(request, "x-aegis-override-ip"),
         },
+        "tool_governance": {
+            "inbound": [t.to_dict() for t in inbound_tool_report.findings],
+            "outbound": [t.to_dict() for t in (outbound_tool_report.findings if outbound_tool_report else [])],
+            "blocked_calls": [t.to_dict() for t in (outbound_tool_report.blocked_calls if outbound_tool_report else [])],
+            "sanitized": bool(outbound_tool_report and outbound_tool_report.sanitized),
+        },
+        "client_ip": (request.client.host if request.client else None),
     }
 
     async with session_scope() as session:
@@ -365,7 +449,9 @@ async def _proxy(
             decision=final_decision,
             severity=(decision.severity.value if decision.severity else "info"),
             findings=[f.to_dict() for f in decision.findings]
-            + [f.to_dict() for f in outbound_findings],
+            + [f.to_dict() for f in outbound_findings]
+            + [t.to_dict() for t in inbound_tool_report.findings]
+            + [t.to_dict() for t in (outbound_tool_report.findings if outbound_tool_report else [])],
             input_text=plain,
             output_text=output_text,
             latency_ms=int((time.perf_counter() - started) * 1000),
@@ -375,7 +461,16 @@ async def _proxy(
                 "matched_categories": decision.matched_categories,
                 "untrusted_present": decision.untrusted_present,
                 "estimated_cost_usd": round(actual_cost, 6),
-                "overrides": {"budget": override_budget, "loop": override_loop},
+                "overrides": {
+                    "budget": override_budget,
+                    "loop": override_loop,
+                    "action": approve_action,
+                },
+                "tool_governance": {
+                    "blocked_calls": [t.to_dict() for t in (outbound_tool_report.blocked_calls if outbound_tool_report else [])],
+                    "sanitized": bool(outbound_tool_report and outbound_tool_report.sanitized),
+                },
+                "client_ip": (request.client.host if request.client else None),
             },
         )
     tracker.record(ctx.tenant.id, final_decision)

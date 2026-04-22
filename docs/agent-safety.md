@@ -1,4 +1,9 @@
-# Agent safety: indirect injection, runaway loops, and budgets
+# Agent safety: injection, loops, budgets, tools, actions, and identity
+
+This document is the comprehensive reference for the agent-safety controls
+Aegis ships. It maps directly to the everyday-user risk model (loss of
+control, data leakage, unintended actions) and covers six layers — every one
+runs on every request and writes a row to the audit log.
 
 This document covers the controls Aegis ships specifically for **autonomous
 agents** (OpenCLaw / OpenDevin / LangChain / custom orchestrators) and
@@ -171,13 +176,145 @@ shows decisions, severities, findings, sizes, latency, and the full extra
 metadata (including `safety: budget_exceeded` and `safety: loop_detected`
 markers) for any blocked request.
 
+## 5. Tool governance: stop the agent doing things it wasn't asked to
+
+The risk: a model is tricked (or just confused) into calling a tool the user
+didn't ask for — `delete_account()`, `send_payment()`, `email_to_attacker()`.
+Worse: a malicious or compromised plugin teaches the model a brand-new tool
+that the customer never approved, so the model "knows" how to call it.
+
+Aegis closes both holes with a **tenant-scoped tool registry** and a
+**model-emitted tool-call inspector**.
+
+### The registry (admin-controlled allowlist)
+
+Every tool the customer wants the model to be able to use must be
+registered:
+
+```bash
+curl -X POST https://aegis.example.com/admin/api/tools \
+  -H "Content-Type: application/json" -b session.cookie \
+  -d '{
+    "name": "create_calendar_event",
+    "action_class": "write",
+    "schema": { "type":"function", "function":{ "name":"create_calendar_event",
+                "parameters":{...} } },
+    "config": {
+      "allow_domains": ["example.com"],
+      "monetary_threshold_usd": 0
+    }
+  }'
+```
+
+Registration captures:
+
+- `action_class` — `read | write | destructive | financial | network`.
+- `requires_approval` — opt-in even for non-sensitive tools.
+- `schema` (optional) — Aegis stores its SHA-256 hash. If the schema the
+  customer's app *advertises to the model later* doesn't match (a
+  supply-chain plugin mutated it), the request is blocked.
+- `config` — per-tool guardrails: domain allow/deny lists for tools that take
+  URLs, monetary thresholds, etc.
+
+### What the proxy enforces
+
+**Inbound** (the `tools` array on the request):
+
+- Reject any tool that isn't registered → HTTP 451 `tool_registry_block`.
+- Reject any tool whose advertised schema doesn't match the registered
+  `schema_hash` → same status with a reason that calls out supply-chain
+  mutation explicitly.
+
+**Outbound** (model-emitted `tool_calls` / Anthropic `tool_use`):
+
+- Classify the call (`read / write / destructive / financial / network`)
+  using the registered `action_class` or, as a fallback, a transparent
+  keyword heuristic (`delete_*` → destructive, `pay_*` → financial,
+  `browse_*` → network, etc.).
+- Run **URL safety** on the arguments — `extract_urls` walks the args dict;
+  every URL is checked for loopback / RFC1918 / cloud-metadata / disallowed
+  scheme / domain allow-list / domain deny-list. A SSRF target like
+  `http://169.254.169.254/` or `http://10.0.0.5/admin` is blocked even if
+  the model thought it was fine.
+- For sensitive classes (`destructive` and `financial` by default, plus
+  any `requires_approval=true` tool), the call is **stripped from the
+  response unless the request carried `X-Aegis-Approve-Action: 1`**. The
+  client agent never sees a handle it could invoke.
+- For `financial` calls, Aegis reads `amount_usd` / `amount` / `total` /
+  `price` / `cost` / `value` from the args. If the value exceeds the
+  per-tool or per-tenant threshold, the call is blocked even with the
+  default approve toggle off.
+
+In every case the original call, the reason it was blocked, and any
+override flags are written to `aegis.tool_governance` in the response
+envelope and to the `AuditEvent` row, so a security admin can review every
+"the AI tried to do X" event.
+
+### SDK ergonomics
+
+```python
+from aegis_client import AegisClient
+
+with AegisClient("https://aegis.example.com", "aeg_live_…") as a:
+    # Default — sensitive calls get stripped; user is asked to confirm.
+    resp = a.chat(model="gpt-4o-mini", messages=[...], tools=[...])
+
+    # User clicked "yes, proceed" — re-call with explicit approval.
+    confirmed = a.chat(model="gpt-4o-mini", messages=[...], tools=[...],
+                       approve_action=True)
+```
+
+## 6. API key identity: stop credential theft from being useful
+
+The risk: an attacker copies an `aeg_…` key from a developer's `.env` file
+and starts using it from their own machine.
+
+Aegis ships two layers of defence at the auth layer:
+
+### CIDR allowlist (per key)
+
+When you create a key, you can pin it to one or more CIDRs:
+
+```bash
+curl -X POST https://aegis.example.com/admin/api/keys \
+  -H "Content-Type: application/json" -b session.cookie \
+  -d '{ "name": "prod-app", "scopes": ["proxy"],
+        "allowed_ips": ["10.0.0.0/16", "203.0.113.5"] }'
+```
+
+Any request from outside the allowlist returns HTTP 403. There is no
+override header for this — if you really need to extend it, do it in the
+admin UI / API.
+
+### First-seen-IP pin
+
+For keys that legitimately move (developer laptops, CI runners), set
+`pin_first_seen_ip: true`. The very first request locks the key to the /24
+(IPv4) or /48 (IPv6) it was used from. Subsequent requests from a different
+network return:
+
+```http
+HTTP/1.1 403 Forbidden
+{
+  "detail": "API key is pinned to first-seen network 198.51.100.0/24 but
+             request came from 203.0.113.7. Retry with header
+             `X-Aegis-Override-IP: 1` (logged) or rotate the key from the
+             admin console."
+}
+```
+
+The override is recorded so a security admin can spot a developer who
+keeps silencing the alarm.
+
+### Forensic visibility
+
+Every API key now carries `first_seen_ip` and `last_used_ip`. The admin
+console + `/admin/api/keys` endpoint show both. If a stolen key is suspected,
+revoking it propagates instantly because revocation is checked on every
+request.
+
 ## What this does *not* do (yet)
 
-- **Tool-call sandboxing**: Aegis sees the prompt and the response. If your
-  agent uses function/tool calls, Aegis already scans the arguments and
-  results that travel through the LLM, but it does not yet enforce a
-  whitelist of *which* tools may be called — that's on the roadmap
-  (see `docs/roadmap.md`).
 - **Browser sandbox**: Aegis is the gateway, not the headless browser. The
   recommended pattern is to fetch pages in your agent code, then send the
   text via the SDK's `quote_scraped` helper so the gateway sees it as
@@ -186,3 +323,6 @@ markers) for any blocked request.
   for billing-grade accuracy, plug in the upstream `usage` field by adding a
   small adapter post-processing step. The infrastructure is already in
   place — `estimate_cost_usd` is the single point to override.
+- **Argument-schema enforcement**: today Aegis hashes the schema for
+  supply-chain detection. Server-side validation of model-emitted args
+  against the registered JSON Schema is on the roadmap.

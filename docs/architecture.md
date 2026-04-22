@@ -62,6 +62,21 @@ Runtime safety controls that don't fit the per-text policy model.
   bill. Default budgets are always-on.
 - `loops.py` — per-(tenant, key) digest tracker that flags identical-prompt
   repetition over a short window. The classic "buggy agent loop" canary.
+- `actions.py` — deterministic, explainable action classifier
+  (`read / write / destructive / financial / network`). Combines an explicit
+  declaration on the registered tool with a transparent keyword heuristic.
+- `tools.py` — tool governance: validates the request's `tools` array
+  against the tenant's `RegisteredTool` allowlist (with schema-hash check
+  for supply-chain mutation), then inspects the model's emitted tool calls
+  on the response side and *strips* any that are unregistered, hit a
+  blocked URL, are sensitive without an explicit approval, or exceed a
+  monetary threshold.
+- `url_safety.py` — SSRF-aware URL inspector for tool arguments. Blocks
+  loopback / link-local / RFC1918 / cloud metadata / disallowed schemes;
+  enforces per-tool allow/deny domain lists.
+- `network.py` — network-identity helpers: extract the client IP, evaluate
+  CIDR allowlists, compare /24 (IPv4) or /48 (IPv6) for the first-seen-IP
+  key pin.
 
 ### `aegis/pricing.py`
 

@@ -43,6 +43,8 @@ class AegisClient:
         untrusted: bool = False,
         override_budget: bool = False,
         override_loop: bool = False,
+        approve_action: bool = False,
+        override_ip: bool = False,
     ) -> dict[str, Any]:
         headers: dict[str, str] = {}
         if untrusted:
@@ -51,6 +53,10 @@ class AegisClient:
             headers["X-Aegis-Override-Budget"] = "1"
         if override_loop:
             headers["X-Aegis-Override-Loop"] = "1"
+        if approve_action:
+            headers["X-Aegis-Approve-Action"] = "1"
+        if override_ip:
+            headers["X-Aegis-Override-IP"] = "1"
         resp = self._client.post(path, json=body, headers=headers or None)
         try:
             data = resp.json()
@@ -72,6 +78,7 @@ class AegisClient:
         untrusted: bool = False,
         override_budget: bool = False,
         override_loop: bool = False,
+        approve_action: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
         body = {"model": model, "messages": messages, **kwargs}
@@ -81,6 +88,7 @@ class AegisClient:
             untrusted=untrusted,
             override_budget=override_budget,
             override_loop=override_loop,
+            approve_action=approve_action,
         )
 
     def messages(
@@ -91,6 +99,7 @@ class AegisClient:
         untrusted: bool = False,
         override_budget: bool = False,
         override_loop: bool = False,
+        approve_action: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
         body = {"model": model, "messages": messages, **kwargs}
@@ -100,6 +109,7 @@ class AegisClient:
             untrusted=untrusted,
             override_budget=override_budget,
             override_loop=override_loop,
+            approve_action=approve_action,
         )
 
     def check(

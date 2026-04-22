@@ -278,3 +278,134 @@ def test_policy_me_includes_usage_stats(client):
     data = r.json()
     assert "usage_last_hour" in data and "tenant" in data["usage_last_hour"]
     assert "scan_injection" in data["policy"]
+
+
+def test_proxy_blocks_unregistered_tool_advertisement(client, mock_transport):
+    _set_creds(client)
+    key = _create_key(client)
+    body = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "ok"}],
+        "tools": [{"type": "function", "function": {"name": "delete_files", "parameters": {}}}],
+    }
+    r = client.post("/v1/chat/completions", json=body, headers={"Authorization": f"Bearer {key}"})
+    assert r.status_code == 451, r.text
+    assert r.json()["error"]["type"] == "tool_registry_block"
+    assert mock_transport.last_body is None
+
+
+def test_proxy_strips_destructive_outbound_tool_call(client, monkeypatch):
+    """When the model emits a destructive tool_call, Aegis strips it unless approved."""
+    _set_creds(client)
+    key = _create_key(client)
+    _login(client)
+    # Register a destructive tool so the *advertisement* is allowed.
+    r = client.post(
+        "/admin/api/tools",
+        json={"name": "delete_user", "action_class": "destructive", "enabled": True},
+    )
+    assert r.status_code == 201, r.text
+
+    # Patch the upstream to return a tool_call back to Aegis.
+    import httpx as _httpx
+
+    class _ToolTransport(_httpx.AsyncBaseTransport):
+        def __init__(self): self.last_body = None
+        async def handle_async_request(self, req):
+            import json
+            self.last_body = json.loads(req.content.decode())
+            body = {
+                "id": "x",
+                "object": "chat.completion",
+                "model": self.last_body.get("model", "gpt-4o-mini"),
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "tool_calls": [{
+                                "id": "c1", "type": "function",
+                                "function": {"name": "delete_user", "arguments": '{"user_id":1}'},
+                            }],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }
+            return _httpx.Response(200, json=body)
+
+    transport = _ToolTransport()
+    real_init = _httpx.AsyncClient.__init__
+
+    def patched(self, *a, **kw):
+        kw["transport"] = transport
+        real_init(self, *a, **kw)
+
+    monkeypatch.setattr(_httpx.AsyncClient, "__init__", patched)
+
+    body = {
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "do it"}],
+        "tools": [{"type": "function", "function": {"name": "delete_user", "parameters": {}}}],
+    }
+    # Earlier tests in this file install a tight per-tenant budget; opt out
+    # of that *and* of the loop detector so we are isolated to tool gov.
+    base_headers = {
+        "Authorization": f"Bearer {key}",
+        "X-Aegis-Override-Budget": "1",
+        "X-Aegis-Override-Loop": "1",
+    }
+    r = client.post("/v1/chat/completions", json=body, headers=base_headers)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["choices"][0]["message"].get("tool_calls") in (None, [])
+    assert any("approval" in t["reason"].lower() for t in data["aegis"]["tool_governance"]["blocked_calls"])
+
+    # With explicit approval header, the call is preserved.
+    body2 = dict(body)
+    body2["messages"] = [{"role": "user", "content": "do it now please"}]
+    r2 = client.post(
+        "/v1/chat/completions",
+        json=body2,
+        headers={**base_headers, "X-Aegis-Approve-Action": "1"},
+    )
+    assert r2.status_code == 200, r2.text
+    data2 = r2.json()
+    assert data2["choices"][0]["message"]["tool_calls"]
+    assert data2["aegis"]["overrides"]["action"] is True
+
+
+def test_api_key_first_seen_pin_blocks_other_ip_then_allows_with_override(client):
+    """Pinned key authenticated from one IP is blocked from another IP."""
+    _login(client)
+    # Create a pinned key.
+    r = client.post(
+        "/admin/api/keys",
+        json={"name": "pinned", "scopes": ["proxy"], "pin_first_seen_ip": True},
+    )
+    assert r.status_code == 201
+    key = r.json()["plaintext"]
+
+    # First call (TestClient default IP "testclient") locks the pin.
+    r1 = client.get("/v1/policy/me", headers={"Authorization": f"Bearer {key}"})
+    assert r1.status_code == 200
+
+    # Second call from a *different* X-Forwarded-For is rejected.
+    r2 = client.get(
+        "/v1/policy/me",
+        headers={"Authorization": f"Bearer {key}", "X-Forwarded-For": "203.0.113.7"},
+    )
+    assert r2.status_code == 403
+    assert "pinned" in r2.json()["detail"].lower()
+
+    # With explicit IP override it goes through.
+    r3 = client.get(
+        "/v1/policy/me",
+        headers={
+            "Authorization": f"Bearer {key}",
+            "X-Forwarded-For": "203.0.113.7",
+            "X-Aegis-Override-IP": "1",
+        },
+    )
+    assert r3.status_code == 200
